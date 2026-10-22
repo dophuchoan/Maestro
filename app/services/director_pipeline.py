@@ -2919,23 +2919,38 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     validation_params["video_model"] = video_model
     _validate_director_models(validation_params, stages=("video",))
 
-    # Determine the output directory
+    # Resolve the pipeline output directory before validating uploaded images.
     pipeline_file = _find_pipeline_file(out_dir, pid)
     clip_out_dir = os.path.dirname(pipeline_file) if pipeline_file else out_dir
 
-    # Generated-image projects retain the strict I2V contract. Prompt-only
-    # and direct-reference projects intentionally have no start-image file.
+    # Custom (dophuchoan, merged 2026-10-22): an explicitly uploaded,
+    # already-saved start image should count even for PROMPT_ONLY, where
+    # Image Model = None would otherwise suppress local image creation.
+    start_img = str(clip.get("start_image_filename") or "").strip()
+    has_uploaded_image = bool(
+        start_img
+        and not _invalid_saved_media_numbers(
+            [start_img], 1, clip_out_dir, "image"
+        )
+    )
+
+    if shot_image_policy == SHOT_IMAGE_PROMPT_ONLY and has_uploaded_image:
+        uses_shot_images = True
+
     start_path = ""
     if uses_shot_images:
-        start_img = clip.get("start_image_filename")
-        if _invalid_saved_media_numbers(
-            [start_img], 1, clip_out_dir, "image",
-        ):
+        if not has_uploaded_image:
             raise ValueError(
-                "This clip has no valid start image. Regenerate its start image "
-                "before regenerating video."
+                "This clip has no valid saved start image. "
+                "Upload a start image before regenerating video."
             )
         start_path = os.path.join(clip_out_dir, start_img)
+
+    print(
+        f"[Pipeline {pid}] Clip {clip_index + 1} rerun: "
+        f"uses_shot_images={uses_shot_images}, "
+        f"start_image={start_path or 'None'}"
+    )
 
     # Reconstruct the SAME carried frame schedule used by a full Director run.
     # Generators only accept lengths on a model-specific latent lattice. A
@@ -5942,22 +5957,25 @@ def _run_pipeline(pid: str, resume: bool = False):
             )
         )
         if _prepared_imgs_ok:
+            # Custom (dophuchoan, merged 2026-10-22): copy prepared/reviewed
+            # scene images into the pipeline folder with stable names, so a
+            # saved project does not depend on paths outside the pipeline.
             clip_images = []
-            pipeline_root = os.path.realpath(pipeline_out_dir)
-            for path in prepared_image_paths:
-                resolved_path = os.path.realpath(path)
-                try:
-                    inside_pipeline = (
-                        os.path.commonpath([resolved_path, pipeline_root])
-                        == pipeline_root
-                    )
-                except ValueError:
-                    # Windows paths on different drives have no common path.
-                    inside_pipeline = False
-                clip_images.append(
-                    os.path.relpath(resolved_path, pipeline_root)
-                    if inside_pipeline else resolved_path
+            os.makedirs(pipeline_out_dir, exist_ok=True)
+
+            for index, path in enumerate(prepared_image_paths, start=1):
+                source = os.path.realpath(path)
+                extension = os.path.splitext(source)[1].lower()
+
+                filename = f"director_{pid}_shot_{index:03d}{extension}"
+                destination = os.path.realpath(
+                    os.path.join(pipeline_out_dir, filename)
                 )
+
+                if os.path.normcase(source) != os.path.normcase(destination):
+                    shutil.copy2(source, destination)
+
+                clip_images.append(filename)
             clip_keyframes = [[] for _ in clip_images]
             print(
                 f"[Pipeline {pid}] Prepared revision: reusing "
@@ -6263,10 +6281,20 @@ def _ensure_llm_loaded(params: dict):
         else:
             print("[Pipeline] Generation in progress — skipping pre-LLM VRAM release")
 
-    # The loader compares the complete recipe, including experimental MTP.
-    # Keep an identical writer resident; apply changed settings on the next
-    # planning load rather than interrupting a request when settings are saved.
-    llm_service.load_model(
+    # Custom (dophuchoan, merged 2026-10-22): if a different model/provider
+    # is already loaded, unload it first so planning does not silently keep
+    # using the old model. MTP acceleration from upstream is preserved.
+    if llm_service.is_loaded():
+        status = llm_service.get_status()
+        if status.get("model_id") != desired_model or status.get("provider") != desired_provider:
+            llm_service.unload_model()
+            llm_service.load_model(
+        model_id=desired_model, device=desired_device, provider=desired_provider,
+        remote_url=desired_remote_url, api_key=desired_api_key,
+        mtp_acceleration=services_cfg.get("llm_mtp_acceleration") is True,
+    )
+    else:
+        llm_service.load_model(
         model_id=desired_model, device=desired_device, provider=desired_provider,
         remote_url=desired_remote_url, api_key=desired_api_key,
         mtp_acceleration=services_cfg.get("llm_mtp_acceleration") is True,
@@ -7471,7 +7499,25 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
     director_strategy = video_strategy(model_def)
     execution_profile = _director_video_execution_profile(params)
     shot_image_policy = _director_effective_shot_image_policy(params)
-    uses_shot_images = shot_images_required(shot_image_policy)
+
+    # Custom (dophuchoan, merged 2026-10-22): PROMPT_ONLY should still use an
+    # explicitly uploaded, already-saved start image instead of suppressing it.
+    uses_shot_images = shot_images_required(shot_image_policy) or (
+        shot_image_policy == SHOT_IMAGE_PROMPT_ONLY
+        and any(
+            isinstance(name, str)
+            and name.strip()
+            and os.path.isfile(
+                os.path.join(out_dir or _wgp.save_path, name)
+            )
+            for name in (clip_images or [])
+        )
+    )
+
+    print(
+        f"[Pipeline {pid}] Start-image conditioning: "
+        f"enabled={uses_shot_images}"
+    )
     is_minimax_h3 = str(
         model_def.get("architecture") or video_model
     ).lower().startswith("minimax_h3")
@@ -8065,6 +8111,11 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
         CLIP_SEPARATOR = "\n---CLIP_BOUNDARY---\n"
 
         has_any_start = any(p for p in image_start_paths)
+        print(
+            f"[Pipeline {pid}] I2V input images: "
+            f"{sum(bool(p) for p in image_start_paths)}/"
+            f"{len(clip_plans)}"
+        )
         has_any_end = any(p for p in image_end_paths)
         if (
             uses_shot_images
