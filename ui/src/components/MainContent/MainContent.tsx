@@ -15,7 +15,7 @@ import { createGalleryViewerSurface } from '../../lib/galleryFullscreen'
 import { toggleFavorite as saveFavorite } from '../../api/client'
 import { formatEstimatedClock, formatEtaDuration } from '../../lib/format'
 import { PROMPT_ENHANCEMENT_ACTIVITY } from '../../lib/promptEnhancementActivity'
-import type { GenerationJob, OutputFile } from '../../types'
+import type { GenerationJob, OutputFile, MediaFilter } from '../../types'
 
 type ViewerSession = {
   id: string
@@ -697,12 +697,48 @@ export function MainContent() {
   const navigationReleaseFrame = useRef<number | null>(null)
   const previousGalleryScope = useRef(galleryScope)
 
+  // Per-tab scroll preservation (custom, 2026-10-23): remember the feed
+  // scroll position for each gallery tab (All / Images / Videos / Audio /
+  // Edits / Multi-clip / Favorites) and restore it when returning to that
+  // tab. Only a workspace or search change is a genuinely new list and
+  // still resets to the top. Positions are also saved on every scroll
+  // (see handleFeedScroll), so leaving a tab mid-scroll is preserved too.
+  const scrollByFilterRef = useRef<Partial<Record<MediaFilter, number>>>({})
+  const filterScrollRestoredRef = useRef(false)
+
   useLayoutEffect(() => {
     if (previousGalleryScope.current === galleryScope) return
+    const previousScope = previousGalleryScope.current
     previousGalleryScope.current = galleryScope
-    // Folder/filter/search changes select the start of a new result list.
-    // An old scroll position must not immediately replace that selection.
-    feedRef.current?.scrollTo({ top: 0, behavior: 'auto' })
+    const feedEl = feedRef.current
+    if (!feedEl) return
+    // galleryNavigationScope is [workspace, browsingAllFolders,
+    // browsingUploads, mediaFilter, outputSearchQuery]. A change in
+    // anything except mediaFilter means a new list, not a tab switch.
+    let isFilterOnlyChange = false
+    try {
+      const prev = JSON.parse(previousScope) as unknown[]
+      const next = JSON.parse(galleryScope) as unknown[]
+      isFilterOnlyChange = prev[0] === next[0] && prev[1] === next[1]
+        && prev[2] === next[2] && prev[4] === next[4] && prev[3] !== next[3]
+    } catch {
+      isFilterOnlyChange = false
+    }
+    if (!isFilterOnlyChange) {
+      // Workspace or search changed: start the new list at the top and
+      // drop positions saved for the previous list.
+      scrollByFilterRef.current = {}
+      feedEl.scrollTo({ top: 0, behavior: 'auto' })
+      return
+    }
+    const mediaFilter = useStore.getState().mediaFilter
+    const saved = scrollByFilterRef.current[mediaFilter] ?? 0
+    const maxTop = Math.max(0, feedEl.scrollHeight - feedEl.clientHeight)
+    const top = Math.min(saved, maxTop)
+    filterScrollRestoredRef.current = true
+    if (Math.abs(feedEl.scrollTop - top) > 1) {
+      feedEl.scrollTo({ top, behavior: 'auto' })
+    }
   }, [galleryScope])
 
   const releaseNavigationTarget = useCallback(() => {
@@ -845,6 +881,14 @@ export function MainContent() {
   const navigationIndex = navigationTarget?.scope === galleryScope ? outputIds.indexOf(navigationTarget.id) : -1
 
   useLayoutEffect(() => {
+    if (filterScrollRestoredRef.current) {
+      // A tab switch just restored this tab's saved position. A tab whose
+      // items are disjoint from the previous tab (e.g. Images vs Videos)
+      // must not immediately jump back to the top.
+      filterScrollRestoredRef.current = false
+      previousOutputIds.current = retainedOutputIds
+      return
+    }
     if (previousOutputIds.current.size > 0 && outputIds.length > 0
       && !outputIds.some(id => previousOutputIds.current.has(id))) {
       feedRef.current?.scrollTo({ top: 0, behavior: 'auto' })
@@ -1011,6 +1055,8 @@ export function MainContent() {
   const handleFeedScroll = useCallback(() => {
     const el = feedRef.current
     if (!el) return
+    // Remember this tab's position before the user switches away.
+    scrollByFilterRef.current[useStore.getState().mediaFilter] = el.scrollTop
     setScrollTop(el.scrollTop)
     scheduleCenteredSelection()
     // Trigger load-more when within 2 screens of the bottom
