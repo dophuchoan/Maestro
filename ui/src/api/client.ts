@@ -2365,7 +2365,7 @@ export async function llmEnhancePrompt(params: {
 
 // --- Audio Analysis ---
 
-export async function uploadAudio(file: File): Promise<{
+export async function uploadAudio(file: File, signal?: AbortSignal): Promise<{
   filename: string
   path: string
   url: string
@@ -2376,6 +2376,7 @@ export async function uploadAudio(file: File): Promise<{
   const res = await fetch(`${BASE}/api/v1/upload-audio`, {
     method: 'POST',
     body: form,
+    signal,
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Upload failed' }))
