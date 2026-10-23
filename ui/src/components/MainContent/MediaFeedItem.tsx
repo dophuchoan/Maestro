@@ -114,6 +114,13 @@ export function MediaFeedItem({ file, index, isActive, onActivate, onPlaybackSta
   const isDirectorChild = file.type === 'video'
     && !!file.director_pipeline_id
     && file.director_clip_index != null
+  // Custom (dophuchoan): Studio per-clip fix label, read from the Gallery
+  // item field populated from the output sidecar. Display-only: it never
+  // renames or moves the file. Director children already have their own
+  // badge above, so this badge is only for standalone Studio fixes.
+  const isStudioFix = file.type === 'video'
+    && !isDirectorChild
+    && file.studio_director_clip_index != null
   // Uploads stay outside workspace move/favorite actions. Their dedicated
   // delete endpoint is safe for this virtual folder.
   const browsingUploads = useStore(s => s.browsingUploads)
@@ -896,6 +903,11 @@ export function MediaFeedItem({ file, index, isActive, onActivate, onPlaybackSta
         {isDirectorChild && (
           <span className="absolute bottom-2 left-2 rounded-md border border-accent-blue/35 bg-black/70 px-2 py-1 text-[10px] font-medium text-blue-100">
             Clip {(file.director_clip_index ?? 0) + 1}
+          </span>
+        )}
+        {isStudioFix && (
+          <span className="absolute bottom-2 left-2 rounded-md border border-amber-400/40 bg-black/70 px-2 py-1 text-[10px] font-medium text-amber-100">
+            Sửa từ Studio · Clip {(file.studio_director_clip_index ?? 0) + 1}
           </span>
         )}
         {file.type === 'video' && onOpenViewer && (

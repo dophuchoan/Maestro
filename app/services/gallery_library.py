@@ -109,6 +109,11 @@ class GalleryLibrary:
             mci = None
         director_id = meta.get("director_pipeline_id") or params.get("_director_pipeline_id")
         director_id = director_id if isinstance(director_id, str) else None
+        # Custom (dophuchoan): Studio per-clip fix stamp, saved in sidecar
+        # params by generate_video. Read-only here; never touches the file.
+        studio_clip_index = params.get("studio_director_clip_index")
+        if isinstance(studio_clip_index, bool) or not isinstance(studio_clip_index, int) or studio_clip_index < 0:
+            studio_clip_index = None
         clip_index = meta.get("director_clip_index", params.get("_director_clip_index"))
         if clip_index is None and isinstance(mci, dict):
             clip_index = mci.get("index")
@@ -121,6 +126,7 @@ class GalleryLibrary:
             "multi_clip_info": mci,
             "director_pipeline_id": director_id,
             "director_clip_index": clip_index,
+            "studio_director_clip_index": studio_clip_index,
             "director_joined": bool(director_id and (
                 artifact_kind == "joined" or (
                     artifact_kind is None and "_multiclip" in os.path.basename(path).lower()
@@ -231,6 +237,8 @@ class GalleryLibrary:
                         item["director_pipeline_id"] = meta["director_pipeline_id"]
                     if meta["director_clip_index"] is not None:
                         item["director_clip_index"] = meta["director_clip_index"]
+                    if meta.get("studio_director_clip_index") is not None:
+                        item["studio_director_clip_index"] = meta["studio_director_clip_index"]
                     item.update(name=name, workspace=workspace, path=path,
                                 id=f"{workspace}/{name}", type=kind, size=stat.st_size,
                                 created_at=stat.st_mtime, favorite=name in favs,

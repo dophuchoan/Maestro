@@ -594,6 +594,10 @@ export interface OutputFile {
   director_pipeline_id?: string | null
   /** Zero-based shot position for an individual Director take. */
   director_clip_index?: number | null
+  /** Custom (dophuchoan): zero-based Director plan index of a Studio
+   *  per-clip fix, saved in the output sidecar by generateSingleClip.
+   *  Null/absent for ordinary generations and for Director children. */
+  studio_director_clip_index?: number | null
 }
 
 export type AppMode = 'director' | 'studio' | 'editor'
@@ -1367,6 +1371,12 @@ export interface MultiClip {
   endImage: File | null
   endImagePath: string | null
   durationFrames?: number
+  /** Custom (dophuchoan): zero-based Director plan index stamped at
+   *  "Edit in Studio" time. Travels with the clip when it is reordered or
+   *  edited in Studio, so a per-clip Render can later be recognised as a
+   *  fix of that Director clip. Undefined for clips created by hand in
+   *  Studio, which are not Director clips. */
+  directorClipIndex?: number
 }
 
 export type SettingsTab = 'performance' | 'integrations' | 'notifications'

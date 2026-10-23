@@ -7970,6 +7970,12 @@ def generate_video(
     # Internal image preparation can request a lossless intermediate without
     # changing the user's global gallery format.
     image_output_codec=None,
+    # Custom (dophuchoan): zero-based Director plan index of a Studio
+    # per-clip fix, sent only by generateSingleClip. It is NOT used for
+    # naming or rendering; it is only captured in the output metadata
+    # (via get_function_arguments) so Gallery can label the fix. None for
+    # every other generation type.
+    studio_director_clip_index=None,
 ):
 
 

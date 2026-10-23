@@ -6884,6 +6884,13 @@ export const useStore = create<AppState>((set, get) => ({
       per_clip_frames: [frames],
     }
     ;(singleParams as unknown as Record<string, unknown>).audio_frame_offset = startOffsetFrames
+    // Custom (dophuchoan): carry the Director stamp to the backend, where
+    // it is saved in the output sidecar and later shown as a Gallery label.
+    // Only set when the clip actually came from Director; hand-made Studio
+    // clips have no stamp and must not be labelled as Director fixes.
+    if (typeof clip.directorClipIndex === 'number' && Number.isFinite(clip.directorClipIndex) && clip.directorClipIndex >= 0) {
+      ;(singleParams as unknown as Record<string, unknown>).studio_director_clip_index = clip.directorClipIndex
+    }
     for (const key of ['per_clip_output_frames', 'per_clip_minimax_h3_references'] as const) {
       const value = (state.params as unknown as Record<string, unknown>)[key]
       if (Array.isArray(value) && value.length === state.clips.length) {
@@ -11986,6 +11993,11 @@ export const useStore = create<AppState>((set, get) => ({
         endImage,
         endImagePath: null,
         durationFrames: plannedClip?.duration_frames,
+        // Custom (dophuchoan): stamp the Director plan position now, while
+        // it is still known. generateSingleClip reads this stamp instead of
+        // the clip's current list position, so reordering or deleting other
+        // clips in Studio cannot mislabel the fix.
+        directorClipIndex: i,
       }
     })
 
