@@ -6883,11 +6883,11 @@ export const useStore = create<AppState>((set, get) => ({
       duration_seconds: frames / fps,
       per_clip_frames: [frames],
     }
-    ;(singleParams as Record<string, unknown>).audio_frame_offset = startOffsetFrames
+    ;(singleParams as unknown as Record<string, unknown>).audio_frame_offset = startOffsetFrames
     for (const key of ['per_clip_output_frames', 'per_clip_minimax_h3_references'] as const) {
-      const value = (state.params as Record<string, unknown>)[key]
+      const value = (state.params as unknown as Record<string, unknown>)[key]
       if (Array.isArray(value) && value.length === state.clips.length) {
-        (singleParams as Record<string, unknown>)[key] = [value[index]]
+        (singleParams as unknown as Record<string, unknown>)[key] = [value[index]]
       }
     }
     const saved = {
