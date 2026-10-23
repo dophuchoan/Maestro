@@ -907,7 +907,7 @@ export function MediaFeedItem({ file, index, isActive, onActivate, onPlaybackSta
         )}
         {isStudioFix && (
           <span className="absolute bottom-2 left-2 rounded-md border border-amber-400/40 bg-black/70 px-2 py-1 text-[10px] font-medium text-amber-100">
-            Sửa từ Studio · Clip {(file.studio_director_clip_index ?? 0) + 1}
+            Studio Fix · Clip {(file.studio_director_clip_index ?? 0) + 1}
           </span>
         )}
         {file.type === 'video' && onOpenViewer && (
