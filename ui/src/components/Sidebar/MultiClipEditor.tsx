@@ -1,4 +1,4 @@
-import { Upload, X } from 'lucide-react'
+import { Play, Upload, X } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 
 function ClipDropZone({ file, onFile, onClear }: {
@@ -57,6 +57,8 @@ export function MultiClipEditor() {
   const setClipPrompt = useStore(s => s.setClipPrompt)
   const setClipStartImage = useStore(s => s.setClipStartImage)
   const slidingWindowSeconds = useStore(s => s.slidingWindowSeconds)
+  const fps = useStore(s => s.modelOptions?.fps ?? 24)
+  const generateSingleClip = useStore(s => s.generateSingleClip)
 
   if (clips.length === 0) return null
 
@@ -80,8 +82,18 @@ export function MultiClipEditor() {
                 Clip {i + 1}
               </span>
               <span className="text-[10px] text-text-muted ml-auto">
-                {slidingWindowSeconds}s
+                {clip.durationFrames
+                  ? `${Math.round(clip.durationFrames / fps * 1e3) / 1e3}s`
+                  : `${slidingWindowSeconds}s`}
               </span>
+              <button
+                onClick={() => { generateSingleClip(i) }}
+                title={`Render clip ${i + 1} only`}
+                className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-accent-blue/10 border border-accent-blue/30 text-accent-blue hover:bg-accent-blue/20 transition-colors"
+              >
+                <Play size={10} />
+                Render
+              </button>
             </div>
 
             <ClipDropZone

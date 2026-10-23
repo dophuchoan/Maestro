@@ -84,6 +84,7 @@ let _directorGpuLimitsChanged = false
 let _enhancementDefaultChanged = false
 let _kreaIdentitySettingsChanged = false
 const STUDIO_VIDEO_CREATE_ROUTE_KEY = 'maestro_studio_video_create_route_v1'
+let _singleClipGenerating = false
 
 type StudioVideoRoutePreferences = {
   route: StudioVideoCreateRoute
@@ -1994,6 +1995,7 @@ interface AppState {
   // Generation state (queue)
   jobs: GenerationJob[]
   isGenerating: boolean
+  generateSingleClip: (index: number) => Promise<void>
   startGeneration: (mode?: 'now' | 'queue') => Promise<void>
   startStudioQueue: () => Promise<void>
   stopGeneration: (jobId?: string) => void
@@ -6683,6 +6685,15 @@ export const useStore = create<AppState>((set, get) => ({
   syncClipCount: () => {
     const { params, durationSeconds, slidingWindowSeconds, slidingWindowOverlap, modelOptions } = get()
     if (params.image_mode !== 2) return
+    // Do not re-slice clips that already carry their own per-clip durations,
+    // e.g. a Director transfer where per_clip_frames has one entry per clip.
+    // Without this guard, changing model/duration/window right after
+    // "Edit in Studio" truncates 42 Director clips to
+    // ceil(total duration / sliding window) — about 14 clips.
+    const perClipFrames = params.per_clip_frames
+    if (Array.isArray(perClipFrames) && perClipFrames.length > 0
+      && perClipFrames.length === get().clips.length
+      && perClipFrames.every(frame => typeof frame === 'number' && Number.isFinite(frame) && frame > 0)) return
     const fps = modelOptions?.fps ?? 16
     const overlapSeconds = slidingWindowOverlap / fps
     const effectiveWindow = slidingWindowSeconds - overlapSeconds
@@ -6704,6 +6715,82 @@ export const useStore = create<AppState>((set, get) => ({
 
   jobs: [],
   isGenerating: false,
+
+  // Render one multi-clip entry on its own, with its own prompt, start
+  // image and per-clip duration — instead of joining all clips into one
+  // sliding-window generation that re-chunks Director shots. Ported from
+  // the user's dist build (index-iJwOdDju.js): it temporarily swaps the
+  // store to a single-clip state, reuses startGeneration, then restores
+  // the full clip list. audio_frame_offset keeps the clip's position in
+  // the overall timeline (sum of the previous clips' frames).
+  generateSingleClip: async (index) => {
+    if (_singleClipGenerating) return
+    const state = get()
+    if (state.generationMode !== 'video' || Number(state.params.image_mode) !== 2) return
+    const clip = state.clips[index]
+    if (!clip) return
+    const perClipFrames = state.params.per_clip_frames
+    const clipFrames = (clipIndex: number): number | undefined => {
+      const fromClip = state.clips[clipIndex]?.durationFrames
+      if (typeof fromClip === 'number' && Number.isFinite(fromClip) && fromClip > 0) return fromClip
+      const fromParams = Array.isArray(perClipFrames) ? perClipFrames[clipIndex] : undefined
+      return typeof fromParams === 'number' && Number.isFinite(fromParams) && fromParams > 0 ? fromParams : undefined
+    }
+    const frames = clipFrames(index)
+    if (!frames) {
+      set({ promptEnhanceError: `Clip ${index + 1} has no per-clip duration of its own, so it cannot be rendered separately. Generate the full sequence instead.` })
+      return
+    }
+    let startOffsetFrames = 0
+    for (let i = 0; i < index; i++) startOffsetFrames += clipFrames(i) ?? 0
+    const fps = state.modelOptions?.fps ?? 24
+    const prompt = (state.singlePromptMode && state.clips[0]?.prompt) || clip.prompt
+    const singleClip: MultiClip = { ...clip, prompt }
+    const h3WindowPrompts = state.params.h3_window_prompts
+    const singleParams: GenerateParams = {
+      ...state.params,
+      ...(Array.isArray(h3WindowPrompts) && h3WindowPrompts.length === state.clips.length
+        ? { h3_window_prompts: [h3WindowPrompts[index]] }
+        : {}),
+      video_length: frames,
+      duration_seconds: frames / fps,
+      per_clip_frames: [frames],
+    }
+    ;(singleParams as Record<string, unknown>).audio_frame_offset = startOffsetFrames
+    for (const key of ['per_clip_output_frames', 'per_clip_minimax_h3_references'] as const) {
+      const value = (state.params as Record<string, unknown>)[key]
+      if (Array.isArray(value) && value.length === state.clips.length) {
+        (singleParams as Record<string, unknown>)[key] = [value[index]]
+      }
+    }
+    const saved = {
+      clips: state.clips,
+      singlePromptMode: state.singlePromptMode,
+      durationSeconds: state.durationSeconds,
+      slidingWindowSeconds: state.slidingWindowSeconds,
+      params: state.params,
+    }
+    _singleClipGenerating = true
+    set({
+      clips: [singleClip],
+      singlePromptMode: false,
+      durationSeconds: frames / fps,
+      slidingWindowSeconds: frames / fps,
+      params: singleParams,
+    })
+    try {
+      await get().startGeneration('now')
+    } finally {
+      set({
+        clips: saved.clips,
+        singlePromptMode: saved.singlePromptMode,
+        durationSeconds: saved.durationSeconds,
+        slidingWindowSeconds: saved.slidingWindowSeconds,
+        params: saved.params,
+      })
+      _singleClipGenerating = false
+    }
+  },
 
   startGeneration: async (submissionMode = 'now') => {
     let state = get()
