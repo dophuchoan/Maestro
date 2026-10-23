@@ -705,6 +705,14 @@ export function MainContent() {
   // (see handleFeedScroll), so leaving a tab mid-scroll is preserved too.
   const scrollByFilterRef = useRef<Partial<Record<MediaFilter, number>>>({})
   const filterScrollRestoredRef = useRef(false)
+  // Per-tab scroll v2 (custom, 2026-10-23): setMediaFilter also triggers
+  // loadOutputs(), so the backend list arrives AFTER the first restore.
+  // Keep a pending restore until that backend list has finished loading,
+  // then re-apply it once, so the fresh list cannot silently reset the
+  // feed to the top. A manual scroll by the user cancels the pending
+  // restore, so it never fights a scroll the user started themselves.
+  const pendingFilterRestoreRef = useRef<MediaFilter | null>(null)
+  const restoringScrollRef = useRef(false)
 
   useLayoutEffect(() => {
     if (previousGalleryScope.current === galleryScope) return
@@ -732,11 +740,13 @@ export function MainContent() {
       return
     }
     const mediaFilter = useStore.getState().mediaFilter
+    pendingFilterRestoreRef.current = mediaFilter
     const saved = scrollByFilterRef.current[mediaFilter] ?? 0
     const maxTop = Math.max(0, feedEl.scrollHeight - feedEl.clientHeight)
     const top = Math.min(saved, maxTop)
     filterScrollRestoredRef.current = true
     if (Math.abs(feedEl.scrollTop - top) > 1) {
+      restoringScrollRef.current = true
       feedEl.scrollTo({ top, behavior: 'auto' })
     }
   }, [galleryScope])
@@ -881,6 +891,13 @@ export function MainContent() {
   const navigationIndex = navigationTarget?.scope === galleryScope ? outputIds.indexOf(navigationTarget.id) : -1
 
   useLayoutEffect(() => {
+    if (pendingFilterRestoreRef.current) {
+      // A tab switch is still waiting for its backend list to load.
+      // Do not jump to the top for a disjoint list here; the pending
+      // restore below will put the feed back at the saved position.
+      previousOutputIds.current = retainedOutputIds
+      return
+    }
     if (filterScrollRestoredRef.current) {
       // A tab switch just restored this tab's saved position. A tab whose
       // items are disjoint from the previous tab (e.g. Images vs Videos)
@@ -895,6 +912,27 @@ export function MainContent() {
     }
     previousOutputIds.current = retainedOutputIds
   }, [outputIds, retainedOutputIds])
+
+  // Re-apply a pending per-tab restore after the backend list for the
+  // newly selected tab has finished loading (outputsLoading false).
+  // Without this, the fresh backend list can leave the feed at the top
+  // even though the first, pre-load restore already ran.
+  useEffect(() => {
+    if (outputsLoading) return
+    const pending = pendingFilterRestoreRef.current
+    if (!pending) return
+    const feedEl = feedRef.current
+    if (!feedEl) return
+    pendingFilterRestoreRef.current = null
+    const saved = scrollByFilterRef.current[pending] ?? 0
+    const maxTop = Math.max(0, feedEl.scrollHeight - feedEl.clientHeight)
+    const top = Math.min(saved, maxTop)
+    if (Math.abs(feedEl.scrollTop - top) > 1) {
+      filterScrollRestoredRef.current = true
+      restoringScrollRef.current = true
+      feedEl.scrollTo({ top, behavior: 'auto' })
+    }
+  }, [outputsLoading, outputs])
 
   // Dynamic estimated item height based on actual container width
   const estimatedItemHeight = Math.round(containerWidth * ASPECT_RATIO) + INFO_BAR_HEIGHT
@@ -1055,6 +1093,15 @@ export function MainContent() {
   const handleFeedScroll = useCallback(() => {
     const el = feedRef.current
     if (!el) return
+    if (restoringScrollRef.current) {
+      // This scroll event came from our own restore, not from the user.
+      // Keep the pending backend-load restore, do not cancel it.
+      restoringScrollRef.current = false
+    } else {
+      // A real user scroll after a tab switch means the user took control:
+      // cancel the pending restore so it never jumps them back.
+      pendingFilterRestoreRef.current = null
+    }
     // Remember this tab's position before the user switches away.
     scrollByFilterRef.current[useStore.getState().mediaFilter] = el.scrollTop
     setScrollTop(el.scrollTop)
