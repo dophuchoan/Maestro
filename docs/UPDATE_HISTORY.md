@@ -4,6 +4,47 @@ Every dated update announcement from Maestro's first public release onward, newe
 
 [Back to the README](../README.md#updates) · [Detailed changelog](../CHANGELOG.md)
 
+### v4.0.0 (2026-10-29–30) — Dev release candidate
+
+The next major Main release is being prepared on **Dev** as v4.0.0.
+
+- **A fresh appearance:** first opening v4 switches to Graphite Studio in Dark
+  mode, including browsers with a saved theme. This happens once; choose another
+  theme or appearance in Settings afterward and that choice stays saved.
+- **An upgraded Editor and animated titles:** a fuller editing workspace,
+  reviewable Auto-edit plans, chroma key and transparent MOV export; titles can
+  also be generated directly in Studio.
+- **New creative models and tools:** MOSS reference editors, Fibo 2.0, H3
+  accelerators/PTD/two-pass options, FlashVSR+ Turbo and experimental Pika H3
+  Flex with motion/audio sliding windows. Flex is enabled in the default Frames
+  and References lists. Worlds and Profile 0 remain optional experimental tools.
+- **Smoother daily use:** compact pinned Studio controls, clearer startup and
+  mobile loading, resizable thumbnails, image-workflow fixes and quieter logs.
+
+The existing Dev updates are included. See the
+[v4.0.0 candidate notes and testing limits](RELEASE_NOTES_V4.0.0.md).
+
+### v3.3.0 (2026-10-26) — Dev testing
+
+- **Qwen Image 2.1 reference caching:** optional INT8 caches in VRAM or system
+  RAM, with memory guards and separate positive/negative guidance caches.
+  Disabled remains the default; RAM transfers can trade speed for lower VRAM.
+- **H3 LightX2V accelerators:** four new workflow-matched four/eight-step
+  presets, with pinned weights and their correct video sampling shifts.
+- **FlashVSR+ Turbo:** a separate upscaler in Post Processing, Tools and Editor.
+  Existing FlashVSR selections keep v1.1 and its original behavior.
+- **Optional kernel updates:** compatible WGPKernels 1.4.2 and GGUF CUDA
+  1.0.29 installers, with hash-pinned downloads and existing fallbacks.
+
+Available on **Dev for testing**; Main remains v3.2.5. Update the idle Dev
+installation in Pinokio, restart Maestro and refresh the browser. CPU tests
+and the UI build passed. Functional GPU checks now cover the RTX 4090, 12GB
+RTX 3080 Ti and 8GB RTX 5070 Laptop. Follow-up fixes restore v1.1 sparse
+attention and load the official Plus checkpoint names correctly; all 12 latest
+FlashVSR image/video checks passed. These bounded checks are not a matched
+speed or general quality benchmark. See the
+[v3.3.0 Dev release notes](RELEASE_NOTES_V3.3.0.md).
+
 ### v3.2.5 (2026-10-24)
 
 - **Faster Fish speech:** whole-frame CUDA Graph decoding when the full model

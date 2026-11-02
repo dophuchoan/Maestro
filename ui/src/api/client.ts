@@ -1,4 +1,4 @@
-import type { DirectorModelCompatibility, GenerationPreview, GenerationPreviewSupport, H3WindowPlan, LTXWindowPlan, MiniMaxH3Reference, ProductionPlan, SavedOmniCharacter, ScailResolutionProfile } from '../types'
+import type { DirectorModelCompatibility, EditorOperationCreateRequest, EditorOperationRecord, EditorOperationTransitionRequest, GenerationPreview, GenerationPreviewSupport, H3WindowPlan, LTXWindowPlan, MiniMaxH3Reference, ProductionPlan, SavedOmniCharacter, ScailResolutionProfile } from '../types'
 import type { KreaIdentitySettings } from '../lib/kreaIdentityControls'
 import { getJson } from './readRequest'
 
@@ -75,6 +75,8 @@ export interface ApiJobStatus {
   job_id: string
   /** Stable browser-generated identity used to recover an accepted submit. */
   client_submission_id?: string | null
+  /** Exact Editor round-trip owner, when this is an Editor-linked job. */
+  editor_operation_id?: string | null
   /** Direct submits remain visible while queued for deferred AI planning. */
   show_in_gallery?: boolean
   /** Owning Director pipeline; null for ordinary Studio jobs. */
@@ -228,6 +230,7 @@ export async function submitGeneration(
   status: ApiJobStatus['status']
   h3_window_plan?: H3WindowPlan
   ltx_window_plan?: LTXWindowPlan
+  editor_operation_id?: string | null
 }> {
   const res = await fetch(`${BASE}/api/v1/generate`, {
     method: 'POST',
@@ -316,7 +319,7 @@ export interface StudioPreferenceSettings {
   music_defaults_version?: number
   director_music_model?: string
   h3_optimizations?: {
-    override_attention?: '' | 'sol' | 'sla' | 'veda' | 'sdpa'
+    override_attention?: '' | 'sol' | 'sla' | 'veda' | 'sdpa' | 'sage2'
     skip_steps_cache_type?: '' | 'first_block'
     skip_steps_multiplier?: number
     skip_steps_start_step_perc?: number
@@ -376,6 +379,16 @@ export async function fetchJobStatus(jobId: string): Promise<ApiJobStatus> {
   const res = await fetch(`${BASE}/api/v1/status/${encodeURIComponent(jobId)}`)
   if (!res.ok) throw new Error('Failed to fetch job status')
   return res.json()
+}
+
+export async function fetchJobBySubmission(clientId: string): Promise<ApiJobStatus | null> {
+  const response = await fetch(`${BASE}/api/v1/jobs/by-submission/${encodeURIComponent(clientId)}`)
+  if (response.status === 404) return null
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: 'Could not recover the submission receipt.' }))
+    throw new Error(error.detail || 'Could not recover the submission receipt.')
+  }
+  return response.json()
 }
 
 // --- Music: LLM song writer (Music mode Simple) ---
@@ -441,6 +454,8 @@ export async function submitToolUpscale(params: {
   dlss_depth?: string
   dlss_motion?: string
   temporal_upsampling?: string
+  _editor_operation_id?: string
+  _client_submission_id?: string
 }): Promise<{ job_id: string }> {
   const res = await fetch(`${BASE}/api/v1/tools/upscale`, {
     method: 'POST',
@@ -459,6 +474,8 @@ export async function submitToolFilmGrain(params: {
   intensity: number
   saturation: number
   workspace?: string
+  _editor_operation_id?: string
+  _client_submission_id?: string
 }): Promise<{ job_id: string }> {
   const res = await fetch(`${BASE}/api/v1/tools/film-grain`, {
     method: 'POST',
@@ -479,6 +496,8 @@ export async function submitToolRevoice(params: {
   diffusion_steps?: number
   cfg_rate?: number
   workspace?: string
+  _editor_operation_id?: string
+  _client_submission_id?: string
 }): Promise<{ job_id: string }> {
   const res = await fetch(`${BASE}/api/v1/tools/revoice`, {
     method: 'POST',
@@ -592,6 +611,7 @@ export async function saveEditorProject(
   })
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: 'Project save failed' }))
+    if (res.status === 409) throw new Error('This project changed on another device. Your edits are still here. Save a new version to keep them, or reopen the project to load the newer version.')
     throw new Error(error.detail || 'Project save failed')
   }
   return res.json()
@@ -606,6 +626,48 @@ export async function deleteEditorProject(projectId: string, workspace?: string)
     { method: 'DELETE' },
   )
   if (!res.ok) throw new Error('Failed to delete Editor project')
+}
+
+export async function createEditorOperation(
+  params: EditorOperationCreateRequest,
+): Promise<EditorOperationRecord> {
+  const res = await fetch(`${BASE}/api/v1/editor/operations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: 'Could not create Editor AI operation' }))
+    throw new Error(error.detail || 'Could not create Editor AI operation')
+  }
+  return res.json()
+}
+
+export async function fetchEditorOperation(operationId: string): Promise<EditorOperationRecord> {
+  const res = await fetch(`${BASE}/api/v1/editor/operations/${encodeURIComponent(operationId)}`, {
+    cache: 'no-store',
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: 'Could not recover Editor AI operation' }))
+    throw new Error(error.detail || 'Could not recover Editor AI operation')
+  }
+  return res.json()
+}
+
+export async function transitionEditorOperation(
+  operationId: string,
+  params: EditorOperationTransitionRequest,
+): Promise<EditorOperationRecord> {
+  const res = await fetch(`${BASE}/api/v1/editor/operations/${encodeURIComponent(operationId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: 'Could not update Editor AI operation' }))
+    throw new Error(error.detail || 'Could not update Editor AI operation')
+  }
+  return res.json()
 }
 
 export async function probeEditorMedia(
@@ -688,7 +750,8 @@ export async function fetchEditorExportCapabilities(): Promise<import('../types'
 export async function exportEditorProject(
   project: import('../types').EditorProject,
   mode: 'now' | 'queue' = 'now',
-): Promise<{ job_id: string; status: ApiJobStatus['status'] }> {
+  options?: { itemIds: string[]; format: 'prores4444' },
+): Promise<{ job_id: string; status: ApiJobStatus['status']; revision?: number }> {
   const res = await fetch(`${BASE}/api/v1/editor/export`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -696,6 +759,7 @@ export async function exportEditorProject(
       workspace: project.workspace,
       project,
       queue_mode: mode === 'queue' ? 'held' : 'now',
+      ...(options ? { item_ids: options.itemIds, format: options.format } : {}),
     }),
   })
   if (!res.ok) {
@@ -1435,6 +1499,7 @@ export async function submitRetake(params: {
   num_inference_steps?: number; retake_strength?: number; workspace?: string;
   retake_engine?: string; regenerate_audio?: boolean; resolution?: string;
   activated_loras?: string[]; loras_multipliers?: string;
+  _editor_operation_id?: string; _client_submission_id?: string;
 }): Promise<{ job_id: string; status: string; retake_frames: string }> {
   const res = await fetch(`${BASE}/api/v1/retake`, {
     method: 'POST',
@@ -1515,6 +1580,8 @@ export async function submitEditAnything(params: {
   activated_loras?: string[];
   loras_multipliers?: string;
   workspace?: string;
+  _editor_operation_id?: string;
+  _client_submission_id?: string;
 }): Promise<{
   job_id: string;
   status: string;
@@ -1560,6 +1627,8 @@ export async function submitRepaint(params: {
   activated_loras?: string[];
   loras_multipliers?: string;
   workspace?: string;
+  _editor_operation_id?: string;
+  _client_submission_id?: string;
 }): Promise<{
   job_id: string;
   status: string;
@@ -1662,6 +1731,8 @@ export async function submitRecast(params: {
   activated_loras?: string[];
   loras_multipliers?: string;
   workspace?: string;
+  _editor_operation_id?: string;
+  _client_submission_id?: string;
 }): Promise<{
   job_id: string;
   status: string;
@@ -1782,6 +1853,8 @@ export async function submitOutpaint(params: {
   sliding_window_overlap?: number;
   start_time?: number;
   end_time?: number;
+  _editor_operation_id?: string;
+  _client_submission_id?: string;
 }): Promise<{ job_id: string; status: string }> {
   const res = await fetch(`${BASE}/api/v1/outpaint`, {
     method: 'POST',
@@ -2326,6 +2399,24 @@ export async function fetchLlmModels(): Promise<{ models: import('../types').Llm
   return getJson(`${BASE}/api/v1/llm/models`, 'Failed to fetch LLM models')
 }
 
+export async function planAnimatedTitle(params: {
+  brief: string; style_hint: string; frames: number; background: string; fps?: number; native_h3?: boolean
+}): Promise<{
+  plan: import('../editor/editorAnimatedTitles').TitleCreativePlan | null
+  warnings: string[]; raw_draft: string; review_required: boolean; draft_history_id?: string
+}> {
+  const response = await fetch(`${BASE}/api/v1/llm/plan-title`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params),
+  })
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: 'Title planning failed.' }))
+    throw Object.assign(new Error(error.detail || 'Title planning failed.'), {
+      draft_history_id: response.headers.get('X-Maestro-Draft-History') || undefined,
+    })
+  }
+  return response.json()
+}
+
 export async function llmEnhancePrompt(params: {
   prompt: string
   mode?: string
@@ -2344,6 +2435,7 @@ export async function llmEnhancePrompt(params: {
   tts_voice_count?: number
   max_new_tokens?: number
   reference_context?: string
+  minimax_h3_references?: MiniMaxH3Reference[]
   planning_style?: 'faithful' | 'creative' | 'adaptive'
 }): Promise<{
   original: string

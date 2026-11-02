@@ -3299,6 +3299,8 @@ def _build_enhance_user_prompt(
     from services.adaptive_enhancement import normalize_writing_style
     planning_style = normalize_writing_style(planning_style)
     if mode == "image":
+        from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
         # The Studio split button also applies to still images. Carry the
         # choice through both guided and dedicated raw-enhancer paths.
         style_instruction = (
@@ -3312,7 +3314,8 @@ def _build_enhance_user_prompt(
         return (
             f"[{style_instruction} Preserve all explicit facts, identities, "
             "requested text, reference constraints and edit boundaries. "
-            f"Describe one still image, not a sequence.]\n\n{prompt}"
+            "Describe one still image, not a sequence. "
+            f"{IMAGE_STYLE_GUIDANCE}]\n\n{prompt}"
         )
     if planning_style == "adaptive":
         from services.adaptive_enhancement import adaptive_dialogue_expected, adaptive_dialogue_expansion_requested
@@ -3470,9 +3473,12 @@ def enhance_prompt(
     )
     is_h3_structured = is_h3_context_ir or is_h3_ref2va
     is_flux3_image = mode == "image" and (model_type or "").lower().startswith("flux3")
-    is_moss_image = mode == "image" and (model_type or "").lower().startswith("moss_image")
-    if is_moss_image:
-        # A general cinematic writer cannot safely strip MOSS's layout fields.
+    from services.enhance_guides import moss_image_enhancement_kind
+    moss_enhancement_kind = moss_image_enhancement_kind(model_type or "", mode)
+    is_moss_image_edit = moss_enhancement_kind == "edit"
+    is_moss_image = moss_enhancement_kind == "layout"
+    if is_moss_image or is_moss_image_edit:
+        # A general writer cannot safely rewrite either native MOSS prompt contract.
         raw_enhancer_mode = False
     audio_driven = is_h3_ref2va and has_h3_performance_audio(reference_context)
     needs_h3_dialogue = is_h3_structured and not audio_driven
@@ -3504,6 +3510,10 @@ def enhance_prompt(
         # Inject content guidance
         from services.director.nsfw_guidance import inject_content_guidance
         system = inject_content_guidance(system, nsfw, "enhance")
+        if mode == "image":
+            from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+            system = f"{system}\n\n{IMAGE_STYLE_GUIDANCE}"
         # Inject LoRA hints into system prompt
         if lora_system_hint:
             system = f"{system}\n\n{lora_system_hint}"
@@ -3581,8 +3591,9 @@ def enhance_prompt(
 
     if raw_enhancer_mode:
         # The fine-tuned enhancer (a) doesn't reliably honor a "write N
-        # paragraphs" instruction and (b) likes to prepend a bogus "rendered
-        # in a 3D animation style" clause. Always run the style cleanup; and
+        # paragraphs" instruction and (b) can prepend a bogus video-style
+        # clause. Image requests retain their style wording; the legacy video
+        # cleanup must not strip an explicitly requested illustration/3D look.
         # when the user gave one line per window, enhance each window
         # independently and collapse it to a single paragraph — that makes the
         # output EXACTLY window_count paragraphs regardless of the model.
@@ -3606,7 +3617,7 @@ def enhance_prompt(
                     planning_style,
                 )
                 r = generate(prompt=w_prompt, image_paths=(image_paths if i == 0 else None), **gen_kw)
-                r = _clean_enhancer_output(r)
+                r = r.strip() if mode == "image" and r else _clean_enhancer_output(r)
                 r = " ".join(r.split()) if r else ln  # collapse to one paragraph
                 outs.append(r or ln)
             return repair_text("\n".join(outs))
@@ -3623,7 +3634,8 @@ def enhance_prompt(
         )
         print(f"[Enhance] Raw enhancer ({model_type}, images={bool(image_paths)}, windows={window_count})")
         result = generate(prompt=raw_prompt, image_paths=image_paths, **gen_kw)
-        return repair_text(_clean_enhancer_output(result) or prompt)
+        cleaned = result.strip() if mode == "image" and result else _clean_enhancer_output(result)
+        return repair_text(cleaned or prompt)
 
     adaptive_scripted_dialogue = False
     if planning_style == "adaptive" and needs_h3_dialogue:
@@ -3657,11 +3669,11 @@ def enhance_prompt(
                 "environment. Keep under 150 words. Output only the enhanced prompt."
             ),
             "image": (
-                "You are an expert photographer. Enhance the user's image prompt with "
-                "detailed descriptions of composition, lighting, colors, and mood. "
-                "The output is a STILL PHOTOGRAPH — describe static poses only, no motion verbs "
-                "(no walking, running, reaching, turning, dancing). "
-                "Keep under 150 words. Output only the enhanced prompt."
+                "You are an image prompt editor. Preserve the user's requested medium, "
+                "style, subjects, composition and exact visible text. Clarify useful "
+                "details within that style. A still image can depict an action pose. "
+                "Keep simple briefs concise and detailed briefs complete. "
+                "Output only the enhanced prompt."
             ),
             "audio": (
                 "You are an expert audio producer. Enhance the user's audio description "
@@ -3775,6 +3787,11 @@ def enhance_prompt(
         if nsfw_block:
             system = f"{system}\n\n{nsfw_block}"
 
+    if mode == "image":
+        from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+        system = f"{system}\n\n{IMAGE_STYLE_GUIDANCE}"
+
     # Shared video-enhance rules — e.g. reference characters by a stable visual
     # appearance, not by name/relationship/pronoun (the model has no memory of
     # who anyone is). Appended for video so EVERY path gets it: per-model guides
@@ -3848,6 +3865,27 @@ def enhance_prompt(
                 "object, clothing, setting or style. Follow the user's roles and do not invent "
                 "unseen image content. Do not render the reference tokens as visible lettering.\n\n"
                 f"{user_prompt}"
+            )
+        elif is_moss_image_edit:
+            ordered_map = reference_context.strip() if reference_context else "\n".join(
+                f"Reference image {index + 1} is the attached image in position {index + 1}."
+                for index in range(len(image_paths))
+            )
+            user_prompt = (
+                "Use these MOSS Image Edit references in their attachment order. "
+                "Follow any image roles the user assigns in the brief; the numbered "
+                "map identifies order only and does not assign extra roles.\n\n"
+                f"{ordered_map}\n\n{user_prompt}"
+            )
+        elif mode == "image" and str(model_type or "").startswith("fibo2"):
+            ordered_map = reference_context.strip() if reference_context else "\n".join(
+                f"Image {index + 1} is the attached image in position {index + 1}."
+                for index in range(len(image_paths))
+            )
+            user_prompt = (
+                "Use the attached Fibo images in this exact order. Preserve the edit and "
+                "source roles requested by the user.\n\n"
+                f"{ordered_map}\n\n{user_prompt}"
             )
         elif mode == "image":
             user_prompt = f"I have attached a reference image. Enhance this prompt based on what you see in the image:\n\n{user_prompt}"
@@ -3935,6 +3973,15 @@ def enhance_prompt(
             "active-LoRA guidance may appear when relevant."
         )
     elif is_flux3_image:
+        variant = (
+            "ACTIVE FLUX 3 MODEL: Klein Base is undistilled and supports classifier-free "
+            "guidance; do not describe it as the distilled checkpoint or claim its "
+            "negative-prompt conditioning is ignored. "
+            if str(model_type or "").lower().startswith("flux3_klein_base") else
+            "ACTIVE FLUX 3 MODEL: Klein is the distilled checkpoint with no separate "
+            "negative-prompt conditioning. "
+        )
+        system += "\n\n" + variant + "Maestro owns sampling and guidance settings; do not add them to the caption."
         system += (
             "\n\nFLUX 3 OUTPUT CONTRACT: Return only the final still-image caption or editing "
             "instruction. Native <ref_image_N> tokens identify attached inputs in order and are "
@@ -3945,6 +3992,15 @@ def enhance_prompt(
             "IDs, reference bindings and all coordinates after the caption. Retain each <id> tag. "
             "Only clarify the caption and descriptions; never change, omit or invent layout boxes. "
             "Boxes use [top,left,bottom,right], integers from 0 to 1000, and guide composition rather than exact pixel masks."
+        )
+    elif is_moss_image_edit:
+        system += (
+            "\n\nMOSS IMAGE EDIT OUTPUT CONTRACT: Return one concise, natural-language "
+            "instruction for the requested edit. Honor the user's ordered image roles "
+            "and change only what they asked to change. Preserve unrequested identity, "
+            "composition, visible text, and relevant source details. Do not invent a "
+            "full scene; when a composite is requested, use only the specified elements. "
+            "Do not add image tokens, layout JSON, masks, coordinates, or explanations."
         )
     elif is_moss_image:
         system += (
@@ -4165,7 +4221,10 @@ def enhance_prompt(
         # caption halfway through a <ref_image_N> token and drop later subjects.
         result = _clean_enhance_output(
             result,
-            preserve_structure=is_h3_structured or is_flux3_image or is_moss_image or speech_writer_active,
+            preserve_structure=(
+                is_h3_structured or is_flux3_image or is_moss_image
+                or is_moss_image_edit or speech_writer_active
+            ),
         )
     if is_h3_context_ir and result:
         # Adaptive dialogue may compile named cues into tags. For ordinary
@@ -5555,6 +5614,17 @@ def _build_h3_dialogue_requirement(
     return ""
 
 
+def _h3_dialogue_comparison_text(value: str) -> str:
+    """Ignore layout whitespace without changing spoken words or punctuation."""
+    return " ".join(str(value or "").split())
+
+
+def _h3_dialogue_words_pattern(value: str) -> str:
+    """Match incidental line wrapping or spacing inside an exact speech span."""
+    import re
+    return r"\s+".join(re.escape(word) for word in str(value or "").split())
+
+
 def _h3_dialogue_contract_satisfied(prompt: str, result: str) -> bool:
     import re
     from services.dialogue_writing import dialogue_forbidden
@@ -5565,7 +5635,11 @@ def _h3_dialogue_contract_satisfied(prompt: str, result: str) -> bool:
     has_speaker_id = bool(re.search(r"\(S\d+\)", str(result or "")))
     if quotes:
         return has_speaker_id and all(
-            any(entry_language == language and words == line for entry_language, words in entries)
+            any(
+                entry_language == language
+                and _h3_dialogue_comparison_text(words) == _h3_dialogue_comparison_text(line)
+                for entry_language, words in entries
+            )
             for line in quotes
         )
     if dialogue_forbidden(prompt):
@@ -6050,7 +6124,9 @@ def _h3_context_speaker_binding_plan(
         return plan
     if len(result_entries) != len(source_entries):
         return None
-    if [str(entry["words"]).strip() for entry in result_entries] != expected_words:
+    if [_h3_dialogue_comparison_text(entry["words"]) for entry in result_entries] != [
+        _h3_dialogue_comparison_text(words) for words in expected_words
+    ]:
         return None
     matches = list(re.finditer(
         r"<d>\s*\[([^\]\r\n]+)\]\s*((?:(?!<d>).)*?)\s*</d>",
@@ -6120,7 +6196,7 @@ def _h3_context_speaker_binding_plan(
         language = _canonical_h3_language_tag(match.group(1) or "")
         if language != _canonical_h3_language_tag(expected.get("language") or ""):
             return None
-        if (match.group(2) or "").strip() != str(expected["words"]).strip():
+        if _h3_dialogue_comparison_text(match.group(2)) != _h3_dialogue_comparison_text(expected["words"]):
             return None
         expected_id = int(expected.get("speaker_id") or 0)
         if expected_id <= 0:
@@ -7466,7 +7542,7 @@ def _canonicalize_h3_ref2va_dialogue_speakers(
         speaker_id = entry.get("speaker_id")
         if not speaker_id:
             continue
-        words_pattern = re.escape(str(entry["words"])).replace(r"\ ", r"\s+")
+        words_pattern = _h3_dialogue_words_pattern(entry["words"])
         match = re.compile(
             rf"<d>\s*\[[^\]]+\]\s*{words_pattern}\s*</d>",
             flags=re.DOTALL | re.IGNORECASE,
@@ -7734,8 +7810,8 @@ def _h3_ref2va_dialogue_binding_contract_satisfied(
         # the full ordered tag sequence; the owner loop below alone would allow
         # extra, duplicated, or reordered guest lines after the required turns.
         if only_supplied_dialogue_requested(prompt) and [
-            str(entry["words"]) for entry in result_entries
-        ] != [str(entry["words"]) for entry in source_entries]:
+            _h3_dialogue_comparison_text(entry["words"]) for entry in result_entries
+        ] != [_h3_dialogue_comparison_text(entry["words"]) for entry in source_entries]:
             return False
     definitions_match = re.search(
         r"(?ms)^\s*subject_definitions\s*:(.*?)(?=^\s*summary\s*:)", text
@@ -7746,7 +7822,7 @@ def _h3_ref2va_dialogue_binding_contract_satisfied(
         speaker_id = entry.get("speaker_id")
         if not speaker_id:
             continue
-        words_pattern = re.escape(str(entry["words"])).replace(r"\ ", r"\s+")
+        words_pattern = _h3_dialogue_words_pattern(entry["words"])
         match = re.compile(
             rf"<d>\s*\[[^\]]+\]\s*{words_pattern}\s*</d>",
             flags=re.DOTALL | re.IGNORECASE,
@@ -8596,7 +8672,7 @@ def plan_angle_prompts(
     style_prompt: str,
     num_angles: int = 4,
 ) -> list:
-    """Generate image-edit prompts for camera angle variations of a reference photo.
+    """Generate image-edit prompts for camera angle variations of a reference image.
 
     Uses the LLM to refine each angle category into a short prompt that
     incorporates the user's style description.
@@ -8616,17 +8692,20 @@ def plan_angle_prompts(
     )
 
     system_prompt = (
-        "You are a photography director. Write short image-edit prompts that describe "
-        "how to reframe a reference photo into different camera angles. "
+        "You are an image composition director. Write short image-edit prompts that describe "
+        "how to reframe a reference image into different camera angles. "
         "Each prompt should be under 30 words and describe the framing, angle, and mood. "
         "Incorporate the user's style into each prompt. "
         "Output numbered prompts like '1. prompt text'. Output ONLY the numbered prompts."
     )
+    from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+    system_prompt += "\n\n" + IMAGE_STYLE_GUIDANCE
 
     user_prompt = (
         f"Visual style: {style_prompt}\n\n"
         f"Write {len(angles)} image-edit prompts to create these camera angle variations "
-        f"of a reference photo:\n\n{angle_list}\n\n"
+        f"of a reference image:\n\n{angle_list}\n\n"
         f"Each prompt should describe the camera angle and incorporate the visual style. Go:"
     )
 
@@ -9558,9 +9637,12 @@ def plan_clip_prompts_and_images(
 
     # ── Build system prompt per prompt_type ──────────────────────────
     photo_line = (
-        "You are given a REFERENCE PHOTO — use it to identify the people, "
+        "You are given a REFERENCE IMAGE — use it to identify the people, "
         "their clothing, and the setting.\n"
     ) if has_image else ""
+    from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+    photo_line += IMAGE_STYLE_GUIDANCE + "\n"
 
     char_rule = (
         "- NEVER use character names in image OR video prompts — neither the image "
@@ -9569,7 +9651,7 @@ def plan_clip_prompts_and_images(
         "based on what you visually see in the attached reference image. For example, "
         "write 'the woman in the white lab coat' instead of a character name.\n"
         "- Character names ARE only allowed in spoken dialogue in the video prompt.\n"
-        "- Describe people using what you SEE in the photo + Scene description."
+        "- Describe people using what you SEE in the image + Scene description."
     ) if has_image else (
         "- NEVER use character names in image OR video prompts. Instead, describe each "
         "person by their visual appearance: clothing, hair color, position.\n"
@@ -9586,7 +9668,7 @@ def plan_clip_prompts_and_images(
         "itself calls for a move. Do NOT invent new locations for visual variety — "
         "vary the camera angle, framing, distance, and lighting instead.\n"
         "- Do NOT add subjects, creatures, or objects the Scene Concept and "
-        "reference photos don't contain. Any examples in these instructions "
+        "reference images don't contain. Any examples in these instructions "
         "show FORMAT only — never copy their content into prompts.\n"
         "- Use the lyrics to inspire mood and visual metaphors, NOT literal text.\n"
         "- If a clip says 'Performer:', that person must appear.\n"
@@ -9604,13 +9686,13 @@ def plan_clip_prompts_and_images(
         if has_image:
             system_prompt = (
                 f"You are a creative music video scene designer.\n{photo_line}\n"
-                "Each clip's image prompt EDITS the reference photo to create a visually "
+                "Each clip's image prompt EDITS the reference image to create a visually "
                 "distinct starting frame. Think like a cinematographer choosing each shot — "
                 "vary camera angle, framing, or lighting when it serves the scene, but "
                 "maintain continuity when that makes more sense.\n\n"
                 "Focus your prompt on WHAT TO CHANGE — new camera angles, different framing, "
                 "new settings, repositioned characters, lighting shifts. You do NOT need to "
-                "re-describe things that stay the same as the reference photo.\n\n"
+                "re-describe things that stay the same as the reference image.\n\n"
                 "WHEN TO DESCRIBE CHARACTERS: When you change the setting to a new location, "
                 "re-describe characters by clothing/appearance so the editor knows who to place. "
                 "When the setting stays the same, you only need to describe characters whose "
@@ -9619,17 +9701,17 @@ def plan_clip_prompts_and_images(
                 "GOOD: 'change the setting to a neon-lit club, the woman in the red dress stands center stage under purple lights'\n"
                 "GOOD: 'change to an over-the-shoulder shot from behind the man in the dark jacket, looking at the stage'\n"
                 "BAD: 'Edit the provided image. Show Sarah dancing. Preserve character identity.' — uses name, meta-instructions\n"
-                "BAD: re-describing the entire reference photo when nothing changed\n\n"
+                "BAD: re-describing the entire reference image when nothing changed\n\n"
                 "RULES:\n"
                 f"{shared_rules}"
                 "- Use a mix of shot types (close-ups, wide shots, over-shoulder, etc.) "
                 "where appropriate — but continuity between consecutive clips is fine when it fits.\n"
-                "- The PERFORMER IS the person/character in the reference photo. Anchor them "
+                "- The PERFORMER IS the person/character in the reference image. Anchor them "
                 "explicitly in EVERY prompt ('the [descriptor] from the reference image') — "
                 "describing them loosely as a new character makes the image model invent a "
                 "different-looking one.\n"
-                "- NO motion blur, speed lines, or long-exposure effects — the image is a sharp "
-                "still frame; motion belongs to the video prompt.\n"
+                "- Keep the opening frame in the requested medium. Retain requested "
+                "motion lines, blur or other visual effects without narrating later transitions.\n"
                 "- Focus on WHAT TO CHANGE from the reference. Do not re-describe things that stay the same.\n"
                 "- Do NOT start with 'Edit the provided image' — just describe the changes.\n"
                 "- Do NOT use preservation meta-language ('preserve', 'maintain', 'keep unchanged').\n"
@@ -9680,19 +9762,19 @@ def plan_clip_prompts_and_images(
     else:
         # Combined "both" mode — LLM has full creative control
         image_instruction = (
-            "- I (image edit): EDITS the reference photo to create the FIRST FRAME BEFORE action begins. "
+            "- I (image edit): EDITS the reference image to create the OPENING INSTANT before later video transitions. "
             "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
             "show the room without them. Focus on WHAT TO CHANGE from reference. "
-            "Describe POSES as static states (standing, seated, leaning). "
-            "No motion verbs (walking, running, reaching, heaving, turning). "
-            "No motion blur, speed lines, or long-exposure effects — the frame is sharp. "
+            "Describe the opening-frame pose and scene state. "
+            "Keep later transitions in the video prompt. "
+            "Preserve the requested medium and any deliberate visual effects in that still frame. "
             "Anchor the performer as 'the [descriptor] from the reference image'. "
-            "NEVER use names. Actions belong ONLY in V, never in I.\n"
+            "NEVER use names. Later transitions belong in V; I may show action already underway at the opening instant.\n"
         ) if has_image else (
-            "- I (image): the FIRST FRAME BEFORE action begins — a frozen still photograph. "
+            "- I (image): the OPENING INSTANT before later video transitions — a single still frame in the requested medium. "
             "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
-            "the room is empty. Describe static poses only (standing, seated, leaning). "
-            "No motion verbs (walking, running, reaching, heaving, turning). "
+            "the room is empty. Describe the opening-frame pose and scene state. "
+            "Keep later transitions in the video prompt. "
             "Characters (by appearance, not name), positions, setting, lighting, mood.\n"
         )
         system_prompt = (
@@ -9708,7 +9790,7 @@ def plan_clip_prompts_and_images(
             "'cut to', or 'series of shots'. Character names ARE only allowed in spoken dialogue.\n"
             f"{image_instruction}"
             "- I prompts describe ONE SINGLE STATIC IMAGE — the starting frame that the "
-            "video animates FROM. No motion, no actions, no dancing. Just a frozen "
+            "video animates FROM. Do not narrate later transitions here. Just a frozen "
             "establishing shot: where everyone is, what the setting looks like.\n\n"
             "CREATIVE DIRECTION:\n"
             f"{shared_rules}"
@@ -9984,9 +10066,12 @@ def plan_short_film_prompts(
 
     # ── Build system prompt ──────────────────────────────────────
     photo_line = (
-        "You are given a REFERENCE PHOTO showing the characters. "
+        "You are given a REFERENCE IMAGE showing the characters. "
         "Use it to identify the people, their appearance, clothing, and setting.\n"
     ) if has_image else ""
+    from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+    photo_line += IMAGE_STYLE_GUIDANCE + "\n"
 
     char_rule = (
         "- NEVER use character names in image OR video prompts — neither the image "
@@ -9996,7 +10081,7 @@ def plan_short_film_prompts(
         "write 'the woman in the white lab coat' instead of 'Dr Ava', or "
         "'the man in the blue shirt' instead of 'Mr Johnson'.\n"
         "- Character names ARE only allowed in spoken dialogue in the video prompt.\n"
-        "- Describe characters using what you SEE in the photo + the character descriptions."
+        "- Describe characters using what you SEE in the image + the character descriptions."
     ) if has_image else (
         "- NEVER use character names in image OR video prompts. Instead, describe each "
         "person by their visual appearance: clothing, hair color, position. "
@@ -10010,12 +10095,12 @@ def plan_short_film_prompts(
             system_prompt = (
                 f"You are a cinematic scene designer for a short film.\n{photo_line}\n"
                 f"{char_context}"
-                "Each shot's image prompt EDITS the reference photo to create a starting "
+                "Each shot's image prompt EDITS the reference image to create a starting "
                 "frame. Think like a cinematographer — vary camera angle, framing, or lighting "
                 "when it serves the scene, but maintain continuity when that makes more sense.\n\n"
                 "Focus your prompt on WHAT TO CHANGE — new camera angles, different framing, "
                 "new settings, repositioned characters, lighting shifts. You do NOT need to "
-                "re-describe things that stay the same as the reference photo.\n\n"
+                "re-describe things that stay the same as the reference image.\n\n"
                 "WHEN TO DESCRIBE CHARACTERS: When you change the setting to a new location, "
                 "re-describe characters by clothing/appearance so the editor knows who to place. "
                 "When the setting stays the same, you only need to describe characters whose "
@@ -10025,7 +10110,7 @@ def plan_short_film_prompts(
                 "- 'change the setting to a dark alley with rain. The woman in the white coat stands against a wall.'\n"
                 "- 'change to an over-the-shoulder shot from behind the man, looking across the room'\n\n"
                 "BAD EXAMPLES (never write prompts like this):\n"
-                "- 'change to a bright living room. Woman in pink sits on couch. Man sits next to her.' — re-describes what's already in the reference photo\n"
+                "- 'change to a bright living room. Woman in pink sits on couch. Man sits next to her.' — re-describes what's already in the reference image\n"
                 "- 'Edit the provided image. Show Dr Ava standing.' — uses name, meta-instruction\n\n"
                 "RULES:\n"
                 "- Use a mix of shot types (close-ups, wide shots, over-shoulder, etc.) where "
@@ -10087,19 +10172,19 @@ def plan_short_film_prompts(
     else:
         # Combined "both" mode
         image_instruction = (
-            "- I (image edit): EDITS the reference photo to create the FIRST FRAME BEFORE action begins. "
+            "- I (image edit): EDITS the reference image to create the OPENING INSTANT before later video transitions. "
             "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
             "show the room without them. Focus on WHAT TO CHANGE from reference. "
-            "Describe POSES as static states (standing, seated, leaning). "
-            "No motion verbs (walking, running, reaching, heaving, turning). "
-            "No motion blur, speed lines, or long-exposure effects — the frame is sharp. "
+            "Describe the opening-frame pose and scene state. "
+            "Keep later transitions in the video prompt. "
+            "Preserve the requested medium and any deliberate visual effects in that still frame. "
             "Anchor the performer as 'the [descriptor] from the reference image'. "
-            "NEVER use names. Actions belong ONLY in V, never in I.\n"
+            "NEVER use names. Later transitions belong in V; I may show action already underway at the opening instant.\n"
         ) if has_image else (
-            "- I (image): the FIRST FRAME BEFORE action begins — a frozen still photograph. "
+            "- I (image): the OPENING INSTANT before later video transitions — a single still frame in the requested medium. "
             "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
-            "the room is empty. Describe static poses only (standing, seated, leaning). "
-            "No motion verbs (walking, running, reaching, heaving, turning). "
+            "the room is empty. Describe the opening-frame pose and scene state. "
+            "Keep later transitions in the video prompt. "
             "Characters (by appearance, not name), positions, setting, lighting, mood.\n"
         )
         system_prompt = (
@@ -10117,7 +10202,7 @@ def plan_short_film_prompts(
             "Character names ARE only allowed in spoken dialogue.\n"
             f"{image_instruction}"
             "- I prompts describe ONE SINGLE STATIC IMAGE — the starting frame that "
-            "the video animates FROM. No motion, no actions, no gestures. Just a frozen "
+            "the video animates FROM. Do not narrate later transitions here. Just a frozen "
             "establishing shot: where everyone is, what the setting looks like.\n\n"
             "CINEMATIC DIRECTION:\n"
             "- Match camera complexity to the content. If someone is speaking directly "
@@ -10303,9 +10388,12 @@ def plan_short_film_from_story(
             char_context = "Characters:\n" + "\n".join(char_lines) + "\n\n"
 
     photo_line = (
-        "You are given a REFERENCE PHOTO showing the characters. "
+        "You are given a REFERENCE IMAGE showing the characters. "
         "Use it to identify the people, their appearance, clothing, and setting.\n"
     ) if has_image else ""
+    from services.image_prompt_style import IMAGE_STYLE_GUIDANCE
+
+    photo_line += IMAGE_STYLE_GUIDANCE + "\n"
 
     char_rule = (
         "- NEVER use character names in image_prompt OR video_prompt — neither the "
@@ -10314,7 +10402,7 @@ def plan_short_film_from_story(
         "in frame, based on what you visually see in the attached reference image. "
         "For example, write 'the woman in the white lab coat' instead of a character name.\n"
         "- Character names ARE only allowed in spoken dialogue within the video_prompt.\n"
-        "- Describe characters using what you SEE in the photo + the character descriptions."
+        "- Describe characters using what you SEE in the image + the character descriptions."
     ) if has_image else (
         "- NEVER use character names in image_prompt OR video_prompt. Instead, describe "
         "each person by their visual appearance: clothing, hair color, position.\n"
@@ -10339,18 +10427,18 @@ def plan_short_film_from_story(
 
     # ── System prompt: scene planner + prompt writer ──────────────
     image_instruction = (
-        "- image_prompt: EDITS the reference photo to create the FIRST FRAME BEFORE action begins. "
+        "- image_prompt: EDITS the reference image to create the OPENING INSTANT before later video transitions. "
         "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
         "show the room without them. Focus on WHAT TO CHANGE from reference. "
-        "Describe POSES as static states (standing, seated, leaning). "
-        "No motion verbs (walking, running, reaching, heaving, turning). "
-        "Actions belong ONLY in video_prompt, never in image_prompt. "
+        "Describe the opening-frame pose and scene state. "
+        "Keep later transitions in the video prompt. "
+        "Later transitions belong in video_prompt; image_prompt may show action already underway. "
         "NEVER use character names or meta-instructions.\n"
     ) if has_image else (
-        "- image_prompt: the FIRST FRAME BEFORE action begins — a frozen still photograph. "
+        "- image_prompt: the OPENING INSTANT before later video transitions — a single still frame in the requested medium. "
         "Show the INITIAL STATE: if clothing will be removed, it's still on; if someone enters, "
-        "the room is empty. Describe static poses only (standing, seated, leaning). "
-        "No motion verbs (walking, running, reaching, heaving, turning). "
+        "the room is empty. Describe the opening-frame pose and scene state. "
+        "Keep later transitions in the video prompt. "
         "Characters (by appearance, NOT by name), positions, setting, lighting, mood.\n"
     )
 
@@ -10415,15 +10503,15 @@ def plan_short_film_from_story(
         "- Let the story concept guide you — don't force cinematic complexity onto simple content.\n\n"
         f"{image_instruction}\n"
         "IMAGE PROMPT GUIDE (how to write image_prompt values):\n"
-        "The image_prompt EDITS the reference photo to create a starting frame for each "
+        "The image_prompt EDITS the reference image to create a starting frame for each "
         "scene. Match your approach to the camera style above — vary angle and framing "
         "when the story calls for it, maintain continuity when it doesn't.\n\n"
-        "The image editor starts with the reference photo and applies your changes. "
+        "The image editor starts with the reference image and applies your changes. "
         "Focus your prompt on WHAT TO CHANGE — new camera angles, different framing, "
         "new settings, repositioned characters, lighting shifts. You do NOT need to "
-        "re-describe things that stay the same as the reference photo.\n\n"
+        "re-describe things that stay the same as the reference image.\n\n"
         "IMPORTANT — what each prompt does:\n"
-        "- image_prompt = the FIRST FRAME BEFORE action begins. Describe the shot setup: camera "
+        "- image_prompt = the OPENING INSTANT before later video transitions. Describe the shot setup: camera "
         "angle, framing, setting, lighting, character positions.\n"
         "- video_prompt = all motion, action, dialogue, gestures, camera movement\n\n"
         "WHEN TO DESCRIBE CHARACTERS: When you change the setting to a new location, "
@@ -10460,9 +10548,9 @@ def plan_short_film_from_story(
         "- Character names ARE only allowed in spoken dialogue in the video_prompt\n"
         "- Do NOT start with 'Edit the provided image'\n"
         "- Do NOT use meta-language ('preserve', 'maintain', 'keep unchanged')\n"
-        "- image_prompt = STILL PHOTOGRAPH. No motion verbs whatsoever: no walking, "
-        "running, reaching, heaving, turning, gesturing, raising, dancing. "
-        "Describe static poses only (standing, seated, leaning). All action belongs in video_prompt.\n"
+        "- image_prompt shows one opening frame in the requested medium. "
+        "Preserve the opening pose, including action already underway when requested. "
+        "Keep later transitions and subsequent actions in video_prompt.\n"
         "- Carry forward cumulative visual state changes: if a character got wet, "
         "injured, or changed clothes earlier, mention that difference.\n"
         f"{char_rule}\n"

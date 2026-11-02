@@ -338,6 +338,8 @@ def _load_llm_enhance_helpers():
         "_h3_dialogue_schedule",
         "_build_h3_timed_silence_clause",
         "_build_h3_dialogue_requirement",
+        "_h3_dialogue_comparison_text",
+        "_h3_dialogue_words_pattern",
         "_h3_dialogue_contract_satisfied",
         "_h3_timed_silence_contract_satisfied",
         "_h3_ref2va_reference_rows",
@@ -1098,6 +1100,37 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("VRAM-aware default", duration_slider)
         self.assertIn("manually raise the native pass", duration_slider)
 
+    def test_native_omni_memory_policy_without_gpu_preserves_auto_requests(self):
+        apply_policy = _load_h3_memory_helpers()[
+            "apply_h3_native_omni_memory_policy"
+        ]
+        model_def = {
+            "architecture": "minimax_h3_ref2va",
+            "omni_reference": True,
+        }
+        request = {
+            "resolution": "704x1280",
+            "video_length": 345,
+            "sliding_window_size": 158,
+        }
+        before = dict(request)
+
+        self.assertIsNone(
+            apply_policy(request, model_def, {"gpu_vram_gb": 0})
+        )
+        self.assertEqual(request, before)
+
+        pika_request = {
+            **request,
+            "minimax_h3_reference_sequence": False,
+        }
+        pika_before = dict(pika_request)
+        pika_model_def = {**model_def, "minimax_h3_pika_flex": True}
+        self.assertIsNone(
+            apply_policy(pika_request, pika_model_def, {"gpu_vram_gb": 0})
+        )
+        self.assertEqual(pika_request, pika_before)
+
     def test_full_h3_preflight_recommends_pruned_turbo_without_blocking(self):
         preflight = _load_h3_memory_helpers()["h3_runtime_preflight"]
         full_first_last = {
@@ -1312,7 +1345,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("elif minimax_h3_references:", wgp)
         self.assertIn("_h3_auto_budgets", wgp)
         self.assertIn("_h3_auto_fallbacks", wgp)
-        self.assertIn("resolveResolution(get().modelOptions, preset, ratio)", store)
+        self.assertIn("resolveResolution(state.modelOptions, preset, ratio)", store)
         self.assertIn("findResolutionSelection(res, get().modelOptions)", store)
         self.assertIn("modelOptions?.resolution_preset_order", presets)
         self.assertNotIn("value !== '768p'", director)
