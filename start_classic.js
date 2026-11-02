@@ -2,7 +2,7 @@ const {
   isRtx50,
   legacyRuntimeProfile,
   runtimeProfile,
-} = require("./launcher_profile")
+} = require("./scripts/pinokio/launcher_profile")
 
 module.exports = async (kernel) => {
   let port = await kernel.port()

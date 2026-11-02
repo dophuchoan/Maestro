@@ -6,7 +6,7 @@ module.exports = async (kernel) => {
   const command = [
     kernel.which("powershell") || "powershell", "-NoProfile", "-NonInteractive",
     "-ExecutionPolicy", "Bypass", "-File",
-    "{{path.resolve(cwd, 'app', 'scripts', 'setup_test_ssh.ps1')}}",
+    "{{path.resolve(cwd, '../../app', 'scripts', 'setup_test_ssh.ps1')}}",
     "-PublicKeyFile", "{{args.public_key_file}}",
     "-ClientAddress", "{{args.client_address}}",
     "-AccountName", "{{args.account_name}}",
@@ -15,7 +15,7 @@ module.exports = async (kernel) => {
   return { run: [{
     method: "shell.run",
     params: {
-      path: "app",
+      path: "../../app",
       sudo: true,
       message: { _: command },
     },
@@ -23,6 +23,6 @@ module.exports = async (kernel) => {
     // The elevated shell can return without stdout when Windows blocks or
     // cancels its launch. Verify a fresh receipt in an ordinary shell.
     method: "shell.run",
-    params: { path: "app", message: { _: [...command, "-VerifyOnly"] } },
+    params: { path: "../../app", message: { _: [...command, "-VerifyOnly"] } },
   }] }
 }

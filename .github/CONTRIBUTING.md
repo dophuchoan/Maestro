@@ -8,7 +8,7 @@ pipeline and distributed through [Pinokio](https://pinokio.computer).
 
 Maestro is a Pinokio app, so the easiest dev loop is:
 
-1. Install Maestro through Pinokio (see the [README](README.md)). This creates
+1. Install Maestro through Pinokio (see the [README](../README.md)). This creates
    the Python environment in `app/env/` and installs the app.
 2. Edit the source in place. The layout:
    - **Launcher scripts** (`install.js`, `start.js`, `update.js`, `reset.js`,
@@ -68,7 +68,7 @@ got `git add`-ed).
 
 Please use the **Bug report** issue template — it asks for your logs
 and GPU/VRAM/OS, which is almost always what's needed to reproduce a
-local-generation issue. See [Finding logs](README.md#finding-logs) for the
+local-generation issue. See [Finding logs](../README.md#finding-logs) for the
 correct paths and alternatives if no log file exists. For startup or generation
 problems, use `logs/api/start.js/latest`, relative to Maestro's top-level folder
 containing `start.js`. `latest` is a text file without an extension.
@@ -77,4 +77,21 @@ containing `start.js`. `latest` is a text file without an extension.
 
 Maestro is released under the WanGP Non-Commercial Evaluation License (inherited
 from upstream Wan2GP). By contributing you agree your contributions are licensed
-under the same terms. See [LICENSE](LICENSE).
+under the same terms. See [LICENSE](../LICENSE).
+
+## Launcher and documentation layout
+
+Keep the five core Pinokio lifecycle entries at repository root. Developer-only
+launchers live under `tests/pinokio/`, and the shared launcher profile helper is
+`scripts/pinokio/launcher_profile.js`. Nested launchers must resolve shell,
+filesystem and script paths against the project root explicitly.
+
+Public integration and provenance records belong in `docs/technical/`; testing
+instructions belong in `docs/testing/`. Keep personal research, working plans,
+local settings, logs and generated media outside tracked source. Use a private
+notes directory outside the checkout where practical. `docs/development/` remains
+an ignored local fallback and must not be force-added to Git. The clean-repository
+guard checks these private boundaries in CI.
+
+Run the guard before committing or pushing. CI can flag a violation after a push;
+it cannot make an already published file private or remove it from Git history.

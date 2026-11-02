@@ -3,6 +3,17 @@
 All notable changes to Maestro are documented here. The upstream WanGP
 pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 
+## Repository maintenance - 2026-10-31
+
+- Organize public integration records and testing guides under `docs/technical/`
+  and `docs/testing/`, with linked indexes.
+- Move optional developer launchers to `tests/pinokio/`, the shared profile helper
+  to `scripts/pinokio/`, contribution guidance to `.github/`, and the launcher
+  icon to `docs/images/`. Remove the unused legacy UI screenshot.
+- Archive maintainer working plans privately and remove them from the public
+  branch tree. Extend the repository guard to reject private notes, local
+  configuration and runtime artifacts without printing their contents.
+
 ## [3.2.5] - 2026-10-24
 
 Public Main and Dev release of the 23–24 October Dev updates. See the

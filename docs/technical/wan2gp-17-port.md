@@ -185,7 +185,7 @@ A full-generation follow-up on **2026-10-07** completed 21 H3 generations on
 the RTX 4090 with MMGP Optimized active. It compared INT8 kernels, streaming
 profiles, fixed/manual/dynamic preload, pinning, read ahead, Sage2 head splitting
 and Sol, including a longer reference-and-LoRA confirmation. The reusable
-[memory test bench and measured results](memory-benchmark.md) document the
+[memory test bench and measured results](../testing/memory-benchmark.md) document the
 controls, timings, peak VRAM and limits. These compare options in the ported
 build; they do not establish a speedup over an earlier release or compatibility
 and performance on every other GPU/runtime.

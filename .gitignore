@@ -116,11 +116,16 @@ app/wgp_config.json.bak
 # Optional, separately licensed native DLSS runtime installed by the user.
 app/dlss5/
 
-# Keep this reviewed feature-port plan alongside the source changes.
-!docs/development/
-docs/development/*
-!docs/development/wan2gp-12-71-port-plan.md
-!docs/development/wan2gp-17-port.md
-!docs/development/memory-benchmark.md
-!docs/development/test-bench.md
-!docs/development/h3-veda-port.md
+# Private maintainer state (the CI boundary guard also rejects force-adds).
+/.codex/
+/.agents/
+/.claude/
+/.aws/
+/.ssh/
+/AGENTS.md
+docs/private/
+/.env
+/.env.*
+!/.env.example
+!/.env.sample
+app/services_config.json

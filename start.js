@@ -2,7 +2,7 @@ const {
   isRtx50,
   legacyRuntimeProfile,
   runtimeProfile,
-} = require("./launcher_profile")
+} = require("./scripts/pinokio/launcher_profile")
 
 const appControlFailureEvent = "/(?:smart app control|application control|app control|device guard|wdac).*\\b(?:block(?:ed|ing)?|deny|denied|denial|prevent(?:ed|ing)?|restrict(?:ed|ion)?|unsigned|untrusted|reject(?:ed|ion)?|not allowed|not permitted)\\b|\\b(?:block(?:ed|ing)?|deny|denied|denial|prevent(?:ed|ing)?|restrict(?:ed|ion)?|unsigned|untrusted|reject(?:ed|ion)?|not allowed|not permitted)\\b.*(?:smart app control|application control|app control|device guard|wdac)|this app has been blocked by (?:your )?system administrator|blocked by group policy/i"
 const readyUrlPattern = /^http:\/\/(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d):(?:[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$/

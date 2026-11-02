@@ -31286,7 +31286,7 @@ _mimetypes.add_type("image/svg+xml", ".svg")
 # route is registered before the root StaticFiles mount so the manifest and
 # iOS apple-touch-icon link can both use the same stable URL.
 _maestro_web_icon = os.path.normpath(
-    os.path.join(_app_dir, "..", "maestro_simplified_icon_alpha.png")
+    os.path.join(_app_dir, "..", "docs", "images", "maestro-icon.png")
 )
 if os.path.isfile(_maestro_web_icon):
     @api.get("/maestro-icon.png", include_in_schema=False)

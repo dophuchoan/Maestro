@@ -1,6 +1,6 @@
 const {
   runtimeProfile,
-} = require("./launcher_profile")
+} = require("./scripts/pinokio/launcher_profile")
 
 module.exports = async (kernel) => {
   const runtime = runtimeProfile(kernel)
@@ -108,7 +108,7 @@ module.exports = async (kernel) => {
     // Saves ~60-120s + ~3 GB of redundant downloads on routine updates.
     //
     // Each hardware profile owns its marker. Bumping the marker in
-    // launcher_profile.js makes this gate reinstall that profile on Update;
+    // scripts/pinokio/launcher_profile.js makes this gate reinstall that profile on Update;
     // old markers remain harmless until Reset removes the environment.
     //
     // Recovery path: if torch ever ends up in a broken state (e.g. CPU

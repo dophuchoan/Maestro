@@ -2,7 +2,7 @@ const {
   isSolCapable,
   needsCuda13DriverUpdate,
   runtimeProfile,
-} = require("./launcher_profile")
+} = require("./scripts/pinokio/launcher_profile")
 
 const localWebEndpoint = (local) => {
   if (
@@ -33,7 +33,9 @@ const localWebEndpoint = (local) => {
 
 const testBenchMenu = (endpoint, info) => [{
   icon: "fa-solid fa-flask",
-  text: info.running("test_bench.js") ? "Developer tests (running)" : "Developer tests",
+  text: info.running("tests/pinokio/test_bench.js") || info.running("test_bench.js")
+    ? "Developer tests (running)"
+    : "Developer tests",
   menu: [
     ["smoke", "Diagnostics only"],
     ["prompt", "Prompt regression tests"],
@@ -43,12 +45,12 @@ const testBenchMenu = (endpoint, info) => [{
   ].map(([mode, text]) => ({
     icon: "fa-solid fa-flask",
     text,
-    href: `test_bench.js?mode=${mode}`,
+    href: `tests/pinokio/test_bench.js?mode=${mode}`,
     params: { mode, base_url: endpoint.url },
   })).concat([{
     icon: "fa-solid fa-toggle-on",
     text: "Enable local prompt tests (restart when idle)",
-    href: "test_bench_enable.js",
+    href: "tests/pinokio/test_bench_enable.js",
   }, {
     icon: "fa-regular fa-folder-open",
     text: "Saved test reports",
@@ -61,7 +63,7 @@ module.exports = {
   version: "8.0",
   title: "Maestro",
   description: "An all-in-one, 100% local AI creative studio, director, and multi-track editor. Generate with MiniMax H3, LTX-2.5/2.3, Wan, Flux, Qwen, and more; turn an idea or song into a planned production; then finish it on the timeline. Requires an NVIDIA GPU (6GB+ VRAM).",
-  icon: "maestro_simplified_icon_alpha.png",
+  icon: "docs/images/maestro-icon.png",
   menu: async (kernel, info) => {
     const runtime = runtimeProfile(kernel)
     const solCapable = isSolCapable(kernel)

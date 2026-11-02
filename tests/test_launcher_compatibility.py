@@ -13,6 +13,18 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestPinokioGpuCompatibility(unittest.TestCase):
+    def test_web_icon_route_resolves_the_moved_tracked_asset(self):
+        launcher = (_ROOT / "app" / "launch.py").read_text(encoding="utf-8")
+        icon = _ROOT / "docs" / "images" / "maestro-icon.png"
+
+        self.assertTrue(icon.is_file())
+        self.assertIn(
+            'os.path.join(_app_dir, "..", "docs", "images", "maestro-icon.png")',
+            launcher,
+        )
+        self.assertIn('@api.get("/maestro-icon.png", include_in_schema=False)', launcher)
+        self.assertIn("return FileResponse(", launcher)
+
     def test_installed_app_menu_is_not_hidden_by_early_gpu_detection(self):
         launcher = (_ROOT / "pinokio.js").read_text(encoding="utf-8")
 
@@ -105,7 +117,7 @@ class TestPinokioGpuCompatibility(unittest.TestCase):
         self.assertEqual(imported_version, guarded.group(1))
 
     def test_rtx50_uses_an_isolated_cuda13_runtime(self):
-        profile = (_ROOT / "launcher_profile.js").read_text(encoding="utf-8")
+        profile = (_ROOT / "scripts" / "pinokio" / "launcher_profile.js").read_text(encoding="utf-8")
         installer = (_ROOT / "install.js").read_text(encoding="utf-8")
         torch_script = (_ROOT / "torch.js").read_text(encoding="utf-8")
 
@@ -122,7 +134,7 @@ class TestPinokioGpuCompatibility(unittest.TestCase):
         self.assertIn("Repair H3 Performance Runtime", menu)
 
     def test_legacy_windows_flash_wheel_matches_wangp_documented_abi(self):
-        profile = (_ROOT / "launcher_profile.js").read_text(encoding="utf-8")
+        profile = (_ROOT / "scripts" / "pinokio" / "launcher_profile.js").read_text(encoding="utf-8")
         torch_script = (_ROOT / "torch.js").read_text(encoding="utf-8")
 
         self.assertIn("flash_attn-2.7.4.post1+cu128torch2.7.0", torch_script)
@@ -134,7 +146,7 @@ class TestPinokioGpuCompatibility(unittest.TestCase):
         self.assertIn("uses SageAttention/SDPA", torch_script)
 
     def test_update_can_resume_a_missing_hardware_runtime(self):
-        profile = (_ROOT / "launcher_profile.js").read_text(encoding="utf-8")
+        profile = (_ROOT / "scripts" / "pinokio" / "launcher_profile.js").read_text(encoding="utf-8")
         updater = (_ROOT / "update.js").read_text(encoding="utf-8")
 
         self.assertIn("alreadyCurrentAndReady", updater)

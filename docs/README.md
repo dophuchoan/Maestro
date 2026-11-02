@@ -50,6 +50,7 @@ Start with the [README](../README.md) for installation and the feature overview.
 
 ## Updates and development
 
+- [Technical integration records](technical/README.md) and [testing guides](testing/README.md).
 - [Complete update history](UPDATE_HISTORY.md) — every dated update announcement, including those summarized in the README.
 - [Detailed changelog](../CHANGELOG.md) — development changes and release entries.
 - [Current release notes](RELEASE_NOTES_V3.2.5.md) — v3.2.5 behavior, validation and known limits.

@@ -490,5 +490,5 @@ user work is pending, and save reports in `app/outputs/Test-Bench`.
 
 The optional fleet controller runs the same suite on several reachable PCs
 and collects their diagnostic bundles. It does not update or restart Maestro.
-See [test bench setup and commands](docs/development/test-bench.md) for the
+See [test bench setup and commands](docs/testing/test-bench.md) for the
 manual workflow, API access, and optional key-based Windows SSH diagnostics.

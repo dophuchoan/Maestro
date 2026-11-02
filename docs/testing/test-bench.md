@@ -115,7 +115,7 @@ review the prompts and rendered videos separately.
 
 SSH is for deeper filesystem/process diagnostics. Normal test collection works
 without it. Windows OpenSSH setup needs one elevated session on the test PC;
-the provided `test_ssh_setup.js` invokes the fixed
+the provided `tests/pinokio/test_ssh_setup.js` invokes the fixed
 `app/scripts/setup_test_ssh.ps1` helper through Pinokio's administrative shell.
 Windows may require the person at that PC to approve UAC.
 The action verifies a fresh setup receipt after the elevated shell returns.
@@ -126,7 +126,7 @@ A failed receipt records the phase and Windows error.
 Prepare a dedicated Ed25519 key under the actual Pinokio desktop account:
 
 ```powershell
-pterm start test_ssh_client.js --ref YOUR_CONTROLLER_REF -- --action=prepare
+pterm start tests/pinokio/test_ssh_client.js --ref YOUR_CONTROLLER_REF -- --action=prepare
 ```
 
 Its **private** key stays in ignored `app/settings/test-ssh`, restricted to
@@ -135,7 +135,7 @@ that Windows account and SYSTEM. The action writes a public-key receipt to
 Use the returned source-machine path as `public_key_file`. Then run:
 
 ```powershell
-pterm start test_ssh_setup.js --ref YOUR_TEST_PC_REF -- --public_key_file=RETURNED_PUBLIC_KEY_PATH --client_address=CONTROLLER_PRIVATE_IP --account_name=EXISTING_LOCAL_WINDOWS_USER
+pterm start tests/pinokio/test_ssh_setup.js --ref YOUR_TEST_PC_REF -- --public_key_file=RETURNED_PUBLIC_KEY_PATH --client_address=CONTROLLER_PRIVATE_IP --account_name=EXISTING_LOCAL_WINDOWS_USER
 ```
 
 For an Active Directory sign-in, pass the full `domain\username` identity
@@ -167,7 +167,7 @@ and [key/ACL guide](https://learn.microsoft.com/en-us/windows-server/administrat
 For a bounded diagnostic check, save the setup receipt in ignored
 `app/settings/test_ssh_server.json` on the controller and add `host` (the
 source PC's reachable private address) and `remote_root` (its Maestro path).
-Then run `pterm start test_ssh_client.js --ref YOUR_CONTROLLER_REF -- --action=diagnose`.
+Then run `pterm start tests/pinokio/test_ssh_client.js --ref YOUR_CONTROLLER_REF -- --action=diagnose`.
 This verifies the pinned server key and collects only the selected process
 metadata and last 250 lines of Maestro/LLM logs. The result is
 `ssh-diagnostics.json` in the controller's Test-Bench workspace. A changed
