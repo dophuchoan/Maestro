@@ -45,6 +45,7 @@ Start with the [README](../README.md) for installation and the feature overview.
 
 ## Performance and access
 
+- [ComfyUI integration](ComfyUI.md) — shared model folders, imported workflows and optional execution mappings.
 - [Optional CUDA kernels](optional-kernel-pins.md) — supported stacks, pinned downloads and fallbacks.
 - [Performance Auto-Tune](Performance-auto-tune.md) — hardware recommendations and manual controls.
 - [Experimental Profile 0](Profile-0.md) — separate memory runtime, restart requirements and compatibility limits.
@@ -55,6 +56,7 @@ Start with the [README](../README.md) for installation and the feature overview.
 - [Local language models](LLM-runtime.md) — built-in writers, vision and runtime setup.
 - [LM Studio memory](LM-Studio-memory.md) — releasing external writer memory before generation.
 - [Private remote access and notifications](TAILSCALE_REMOTE_ACCESS.md) — Tailscale HTTPS and device notification setup.
+- [Agent Access](Agent-Access.md) — secure MCP setup, installation-scoped grants, named operations, media uploads and lifecycle limits.
 
 ## Updates and development
 
@@ -62,7 +64,7 @@ Start with the [README](../README.md) for installation and the feature overview.
 - [Complete update history](UPDATE_HISTORY.md) — every dated update announcement, including those summarized in the README.
 - [WanGP October ports](WanGP-October-2026-Ports.md) — first-batch scope and validation limits.
 - [Detailed changelog](../CHANGELOG.md) — development changes and release entries.
-- [Dev v4.0.0 preview notes](RELEASE_NOTES_V4.0.0.md) — current Dev version and the one-time Graphite Dark introduction.
+- [v4.0.0 release notes](RELEASE_NOTES_V4.0.0.md) — features, upgrade behavior, validation scope and the one-time Graphite Dark introduction.
 - [v3.3.0 porting notes](RELEASE_NOTES_V3.3.0.md) — port scope, validation and testing instructions.
-- [Main v3.2.5 release notes](RELEASE_NOTES_V3.2.5.md) — stable release behavior and known limits.
+- [v3.2.5 release notes](RELEASE_NOTES_V3.2.5.md) — previous Main release behavior and known limits.
 - [API examples](../README.md#notification-and-remote-access-api) and [developer prompt bench](../README.md#developer-prompt-bench).

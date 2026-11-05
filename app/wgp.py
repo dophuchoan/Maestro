@@ -95,6 +95,7 @@ from shared.utils.utils import calculate_new_dimensions, get_outpainting_frame_l
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension
 from shared.utils.audio_video import extract_audio_tracks, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_pair_volumes_to_temp_files, save_video, save_image
 from shared.utils.audio_video import save_image_metadata, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, append_sliding_window_audio, create_silent_wav_file
+from services.video_encoding import get_video_encoding
 from shared.utils.audio_metadata import save_audio_metadata, read_audio_metadata, extract_creation_datetime_from_metadata, resolve_audio_creation_datetime
 from shared.utils.video_metadata import save_video_metadata
 from shared.match_archi import match_nvidia_architecture
@@ -1364,9 +1365,11 @@ def validate_settings(state, model_type, single_prompt, inputs):
 
     if "V" in video_prompt_type and "O" in video_prompt_type:
         if image_start is None and video_source is None and "L" not in video_prompt_type and not all_letters(video_prompt_type, "IK"):
-            return err("Aligned Pose transfer requires a Start Image or Source Video to continue to be used")    
+            gr.Info("Aligned Pose transfer requires a Start Image or Source Video to continue to be used")
+            return ret()
         if "A" in video_prompt_type and any_letters(video_prompt_type, "YWZ"):
-            return err("Aligned Pose transfer supports only Inpainting process outside the masked area")    
+            gr.Info("Aligned Pose transfer supports only Inpainting process outside the masked area")
+            return ret()
 
     if test_any_sliding_window(model_type) and image_mode == 0:
         if video_length > sliding_window_size:
@@ -3312,7 +3315,6 @@ def get_transformer_dtype(model_type, transformer_dtype_policy):
                 return torch.float16
             else: 
                 return torch.bfloat16
-        return transformer_dtype
     elif transformer_dtype_policy =="fp16":
         return torch.float16
     else:
@@ -3476,7 +3478,7 @@ def fix_settings(model_type, ui_defaults, min_settings_version = 0):
     if hasattr(model_handler, "fix_settings"):
             model_handler.fix_settings(base_model_type, settings_version, model_def, ui_defaults)
 
-def get_default_settings(model_type):
+def get_default_settings(model_type, *, persist_missing=True):
     def get_default_prompt(i2v):
         if i2v:
             return "Several giant wooly mammoths approach treading through a snowy meadow, their long wooly fur lightly blows in the wind as they walk, snow covered trees and dramatic snow capped mountains in the distance, mid afternoon light with wispy clouds and a sun high in the distance creates a warm glow, the low camera view is stunning capturing the large furry mammal with beautiful photography, depth of field."
@@ -3504,8 +3506,9 @@ def get_default_settings(model_type):
         if len(ui_defaults.get("prompt","")) == 0:
             ui_defaults["prompt"]= get_default_prompt(i2v)
 
-        with open(defaults_filename, "w", encoding="utf-8") as f:
-            json.dump(ui_defaults, f, indent=4)
+        if persist_missing:
+            with open(defaults_filename, "w", encoding="utf-8") as f:
+                json.dump(ui_defaults, f, indent=4)
     else:
         with open(defaults_filename, "r", encoding="utf-8") as f:
             ui_defaults = json.load(f)
@@ -6219,10 +6222,6 @@ def extract_faces_from_video_with_mask(input_video_path, input_mask_path, max_fr
     if len(video) == 0: return None
     frame_height, frame_width, _ = video[0].shape
 
-    if outpainting_dims is not None and outpainting_quantize_margins:
-        # H3's requested canvas and protected rectangle were aligned together.
-        # Fitting the percentage-expanded source again can floor away a block.
-        fit_canvas = None
     num_frames = len(video)
     if any_mask:
         mask_video = get_resampled_video(input_mask_path, start_frame, max_frames, target_fps)
@@ -6318,6 +6317,10 @@ def preprocess_video_with_mask(pre_video_guide, input_video_path, input_mask_pat
 
     if len(video) == 0 or any_mask and len(mask_video) == 0:
         return None, None
+    if outpainting_dims is not None and outpainting_quantize_margins:
+        # H3's requested canvas and protected rectangle were aligned together.
+        # Fitting the percentage-expanded source again can floor away a block.
+        fit_canvas = None
     if fit_crop and outpainting_dims != None:
         fit_crop = False
         fit_canvas = 0 if fit_canvas is not None else None
@@ -7210,7 +7213,8 @@ def _trim_video_tail(clip_path, trim_frames, fps):
 def concatenate_multi_clip_videos(
     clip_paths, output_path, audio_path=None, audio_start_sec=0.0,
     abort_callback=None, pad_audio=False, audio_duration_sec=None,
-    video_duration_sec=None,
+    video_duration_sec=None, max_audio_pad_sec=None,
+    codec_type=None, container=None,
 ):
     """Concatenate video clips into one video, optionally adding a full audio track.
 
@@ -7223,13 +7227,49 @@ def concatenate_multi_clip_videos(
     requested, ``audio_duration_sec`` must identify the exact finite video
     duration; bounding ``apad`` prevents its infinite stream from filling
     ffmpeg's filter buffers before the concat video is flushed.
+    ``max_audio_pad_sec`` additionally probes the source audio and refuses
+    padding a larger gap than the caller's explicit bound.
     """
     import subprocess
     import math
     import time
+    from services.video_encoding import get_video_encoding as _get_video_encoding
+
     output_path = os.path.abspath(output_path)
     output_path_ffmpeg = output_path.replace("\\", "/")
     ffmpeg_bin = os.environ.get("FFMPEG_BINARY", "ffmpeg")
+    configured_video = globals().get("server_config", {})
+    if not isinstance(configured_video, dict):
+        configured_video = {}
+    codec_type = codec_type or configured_video.get("video_output_codec", "libx264_8")
+    container = container or configured_video.get("video_container", "mp4")
+    try:
+        video_encoding = _get_video_encoding(codec_type, container)
+    except (TypeError, ValueError) as exc:
+        print(f"[Multi-Clip] Invalid video encoding choice: {exc}")
+        return False
+    output_extension = os.path.splitext(output_path)[1].lower()
+    if output_extension != video_encoding["extension"]:
+        print(
+            "[Multi-Clip] Output path extension does not match the selected "
+            f"video container ({output_extension or '(none)'} vs "
+            f"{video_encoding['extension']})."
+        )
+        return False
+
+    def _ffprobe_executable():
+        configured = os.environ.get("FFPROBE_BINARY")
+        if configured:
+            return configured
+        executable_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        executable_dir = os.path.dirname(ffmpeg_bin)
+        if executable_dir:
+            sibling = os.path.join(executable_dir, executable_name)
+            if os.path.isfile(sibling):
+                return sibling
+        return executable_name
+
+    ffprobe_bin = _ffprobe_executable()
 
     n = len(clip_paths)
     if n == 0:
@@ -7277,6 +7317,23 @@ def concatenate_multi_clip_videos(
             "source-audio padding is disabled."
         )
         pad_audio = False
+    bounded_audio_padding_requested = max_audio_pad_sec is not None
+    try:
+        max_audio_pad_sec = float(max_audio_pad_sec)
+    except (TypeError, ValueError):
+        if bounded_audio_padding_requested:
+            print("[Multi-Clip] Refusing invalid frame-bounded audio padding.")
+            return False
+        max_audio_pad_sec = None
+    if (
+        max_audio_pad_sec is not None
+        and (
+            not math.isfinite(max_audio_pad_sec)
+            or max_audio_pad_sec < 0
+        )
+    ):
+        print("[Multi-Clip] Refusing invalid frame-bounded audio padding.")
+        return False
     try:
         video_duration_sec = float(video_duration_sec)
     except (TypeError, ValueError):
@@ -7294,7 +7351,6 @@ def concatenate_multi_clip_videos(
     clips_have_audio = False
     if not audio_path:
         try:
-            ffprobe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe")
             probe_result = subprocess.run(
                 [ffprobe_bin, "-i", valid_paths[0].replace("\\", "/"),
                  "-show_streams", "-select_streams", "a", "-loglevel", "error"],
@@ -7323,7 +7379,6 @@ def concatenate_multi_clip_videos(
     # overlaid audio track to progressively desync.
     detected_fps = None
     try:
-        ffprobe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe")
         fps_probe = subprocess.run(
             [ffprobe_bin, "-i", valid_paths[0].replace("\\", "/"),
              "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
@@ -7340,6 +7395,53 @@ def concatenate_multi_clip_videos(
             print(f"[Multi-Clip] Detected clip fps: {detected_fps}")
     except Exception:
         pass
+
+    if bounded_audio_padding_requested:
+        if (
+            not audio_path
+            or not pad_audio
+            or audio_duration_sec is None
+            or video_duration_sec is None
+            or abs(audio_duration_sec - video_duration_sec) > 1e-6
+        ):
+            print(
+                "[Multi-Clip] Refusing frame-bounded audio padding without "
+                "matching finite audio and video durations."
+            )
+            return False
+        try:
+            duration_probe = subprocess.run(
+                [
+                    ffprobe_bin,
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    os.path.abspath(audio_path).replace("\\", "/"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            source_audio_duration = float(duration_probe.stdout.strip())
+            if duration_probe.returncode != 0 or not math.isfinite(source_audio_duration):
+                raise ValueError("ffprobe did not return a finite audio duration")
+        except Exception as exc:
+            print(
+                "[Multi-Clip] Refusing frame-bounded audio padding because "
+                f"the soundtrack duration could not be verified: {exc}"
+            )
+            return False
+        available_audio_duration = max(
+            0.0, source_audio_duration - audio_start_sec,
+        )
+        required_padding = audio_duration_sec - available_audio_duration
+        if required_padding > max_audio_pad_sec + 1e-6:
+            print(
+                "[Multi-Clip] Refusing to hide a soundtrack gap larger than "
+                f"the frame-bound ({required_padding:.6f}s > "
+                f"{max_audio_pad_sec:.6f}s)."
+            )
+            return False
 
     # Build ffmpeg command with concat filter
     cmd = [ffmpeg_bin, "-y"]
@@ -7411,8 +7513,7 @@ def concatenate_multi_clip_videos(
     if detected_fps and detected_fps > 0:
         cmd += ["-r", str(detected_fps), "-vsync", "cfr"]
 
-    cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "fast",
-            "-pix_fmt", "yuv420p", output_path_ffmpeg]
+    cmd += video_encoding["ffmpeg_args"] + [output_path_ffmpeg]
 
     print(f"[Multi-Clip] Running: {' '.join(cmd[:6])} ... [{n} inputs] ... {' '.join(cmd[-8:])}")
 
@@ -8137,8 +8238,8 @@ def generate_video(
     minimax_h3_sequence_clip_frames=None,
     minimax_h3_sequence_memory_override=False,
     minimax_h3_extended_duration=False,
-    # Per-generation, default-off opt-in for ordinary H3 style/content LoRAs
-    # on Pika H3 Flex. Special accelerators remain blocked by its validator.
+    # Per-generation opt-in for ordinary/style FastH3 and Pika LoRAs.
+    # This is never stored on the retained model instance.
     minimax_h3_experimental_loras=False,
     minimax_h3_text_encoder="nvfp4_awq",
     minimax_h3_video_vae="auto",
@@ -8797,7 +8898,7 @@ def generate_video(
         print(f"[LoRA] No LoRAs activated for this generation (model_type={model_type})")
 
     if hasattr(wan_model, "validate_loras"):
-        if model_def.get("minimax_h3_pika_flex"):
+        if model_def.get("minimax_h3_fasth3") or model_def.get("minimax_h3_pika_flex"):
             wan_model.validate_loras(
                 loras_selected,
                 minimax_h3_experimental_loras=minimax_h3_experimental_loras,
@@ -8926,6 +9027,14 @@ def generate_video(
             sliding_window_overlap = (sliding_window_overlap -1) // latent_size * latent_size + 1
     if sliding_window_discard_last_frames !=0:
         sliding_window_discard_last_frames = sliding_window_discard_last_frames // latent_size * latent_size 
+
+    # The overlap is independent of the audio-adjusted current video length.
+    # Compute it before audio conditioning uses it; decide whether another
+    # window is needed after audio has had a chance to shorten the request.
+    if test_any_sliding_window(model_type):
+        reuse_frames = min(sliding_window_size - latent_size, sliding_window_overlap)
+    else:
+        reuse_frames = 0
 
     current_video_length = video_length
     # VAE Tiling
@@ -9197,11 +9306,9 @@ def generate_video(
     # audio handler already trimmed under the threshold.
     if test_any_sliding_window(model_type):
         sliding_window = current_video_length > sliding_window_size
-        reuse_frames = min(sliding_window_size - latent_size, sliding_window_overlap)
     else:
         sliding_window = False
         sliding_window_size = current_video_length
-        reuse_frames = 0
 
     h3_long_sequence_policy_resolver = None
     h3_long_sequence_setting_ids = (
@@ -9321,6 +9428,7 @@ def generate_video(
         guide_start_frame = 0 # pos of of first control video frame of current window  (reuse_frames later than the first processed frame)
         keep_frames_parsed = [] # aligned to the first control frame of current window (therefore ignore previous reuse_frames)
         pre_video_guide = None # reuse_frames of previous window
+        previous_last_frame = None  # temporal-upscaling history for this repeat's windows
         pre_audio_guide, pre_audio_guide_sample_rate = None, 0 # trailing generated audio from previous window, used as clean prefix for next
         h3_long_sequence_tail_fingerprints = {}
         image_size = default_image_size #  default frame dimensions for budget until it is change due to a resize
@@ -10102,6 +10210,17 @@ def generate_video(
                     custom_settings_for_model[
                         "scail2_recast_warmup_frames"
                     ] = recast_warmup_frames
+                pika_local_window_start_frame_no = None
+                if model_def.get("minimax_h3_pika_flex"):
+                    from services.director_video_strategy import (
+                        pika_flex_local_window_start_frame,
+                    )
+
+                    pika_local_window_start_frame_no = (
+                        pika_flex_local_window_start_frame(
+                            aligned_window_start_frame
+                        )
+                    )
                 overridden_inputs = None
                 artifact_metadata = None
                 speech_generation = None
@@ -10208,10 +10327,18 @@ def generate_video(
                     **world_generate_kwargs,
                     **({"minimax_h3_extended_duration": minimax_h3_extended_duration}
                        if str(model_def.get("architecture") or "").startswith("minimax_h3") else {}),
+                    **({"minimax_h3_experimental_loras": minimax_h3_experimental_loras}
+                       if model_def.get("minimax_h3_fasth3") else {}),
                     **({
                         "minimax_h3_multi_window": minimax_h3_multi_window,
                         "minimax_h3_reference_sequence": minimax_h3_reference_sequence,
                         "minimax_h3_experimental_loras": minimax_h3_experimental_loras,
+                        # Keep Pika's continuation cursor task-local. The
+                        # existing window_start_frame_no below remains the
+                        # absolute source timeline used to slice references.
+                        "pika_local_window_start_frame_no": (
+                            pika_local_window_start_frame_no
+                        ),
                     } if model_def.get("minimax_h3_pika_flex") else {}),
                     save_masks=args.save_masks,
                     temperature=temperature,
@@ -11215,7 +11342,14 @@ def generate_video(
                             or original_audio_guide
                             or audio_source
                         )
-                        concat_ext = os.path.splitext(clip_path)[1]
+                        clip_container = os.path.splitext(clip_path)[1].lower().lstrip(".")
+                        if clip_container not in ("mp4", "mkv"):
+                            clip_container = server_config.get("video_container", "mp4")
+                        concat_encoding = get_video_encoding(
+                            server_config.get("video_output_codec", "libx264_8"),
+                            clip_container,
+                        )
+                        concat_ext = concat_encoding["extension"]
                         concat_name = f"{time_flag}_seed{seed}_multiclip{concat_ext}"
                         concat_path = os.path.join(save_path, concat_name)
                         print(f"[Multi-Clip] Concatenating {len(clip_paths)} clips into {concat_path}")
@@ -11227,16 +11361,27 @@ def generate_video(
                             multi_clip_info.get("target_total_frames", 0) or 0
                         )
                         target_duration_sec = None
+                        join_audio_options = {}
                         if target_total_frames > 0:
                             target_fps = float(model_def.get("fps") or fps or 24)
                             target_duration_sec = target_total_frames / max(1.0, target_fps)
-                        if concatenate_multi_clip_videos(
+                            if concat_audio:
+                                join_audio_options = {
+                                    "pad_audio": True,
+                                    "audio_duration_sec": target_duration_sec,
+                                    "max_audio_pad_sec": 1.0 / max(1.0, target_fps),
+                                }
+                        join_succeeded = concatenate_multi_clip_videos(
                             clip_paths,
                             concat_path,
                             concat_audio,
                             audio_start_sec=multi_clip_info.get("audio_start_sec", 0),
                             video_duration_sec=target_duration_sec,
-                        ):
+                            codec_type=concat_encoding["codec_type"],
+                            container=concat_encoding["container"],
+                            **join_audio_options,
+                        )
+                        if join_succeeded:
                             print(f"[Multi-Clip] Concatenated video saved: {concat_path}")
                             with lock:
                                 file_list.append(concat_path)
@@ -11296,6 +11441,12 @@ def generate_video(
                                     concat_configs["audio_guide"] = original_audio_guide
                                 file_settings_list.append(concat_configs)
                             send_cmd("output")
+                        elif join_audio_options:
+                            del clip_store[group_id]
+                            raise RuntimeError(
+                                "Director multiclip audio could not be joined "
+                                "to its exact planned video duration."
+                            )
                         del clip_store[group_id]
 
                 # Play notification sound for single video

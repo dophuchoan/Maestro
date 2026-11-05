@@ -40,9 +40,6 @@ PIKA_FLEX_VIDEO_SHIFT = 12.0
 PIKA_FLEX_AUDIO_SHIFT = 3.0
 PIKA_FLEX_GUIDANCE_SCALE = 1.0
 PIKA_FLEX_LORA_STRENGTH = 1.0
-PIKA_FLEX_FRAME_MINIMUM = 124
-PIKA_FLEX_FRAME_STEP = 17
-PIKA_FLEX_FRAME_MAXIMUM = 362
 PIKA_FLEX_FPS = 24
 PIKA_FLEX_DEFAULT_RESOLUTION = "832x480"
 PIKA_FLEX_REFERENCE_LIMITS = {"image": 9, "video": 3, "audio": 3, "total": 12}
@@ -109,6 +106,8 @@ PIKA_FLEX_HELP = (
     "adapter strength 1, and video/audio shifts 12/3. Frames supports text-to-video "
     "and first/last images. References supports ordered image, video, and audio "
     "references and needs at least one image or video. Begin at 480p / 5.17 seconds. "
+    "References can also generate visuals against an exact supplied soundtrack: "
+    "choose Music / Performance audio in Studio or an audio-driven Director workflow. "
     "SLA is the default on supported GPUs and safely falls back to dense attention when unavailable; SOL is optional experimental attention. "
     "Resolution choices include Pika's official 480p/768p buckets plus standard H3-aligned 540p/720p canvases and an experimental 1080p tier. "
     "Native motion and stereo-audio continuation are available only through explicit rolling-window mode. "
@@ -223,10 +222,18 @@ def pika_flex_capabilities(reference: bool) -> dict[str, Any]:
         "guide_custom_choices": {},
         "video_guide_outpainting": [],
         "mask_preprocessing": {},
-        "director_video_strategy": "",
-        "director_reference_mode": "none",
-        "director_audio_input_mode": "none",
-        "director_shot_image_support": "none",
+        "director_video_strategy": (
+            "omni_reference" if reference else "bounded_start_end"
+        ),
+        "director_reference_mode": (
+            "omni_manifest" if reference else "start_end"
+        ),
+        # Ref2VA can freeze the supplied target audio while the six-step
+        # sampler generates video, matching the upstream a2v contract.
+        "director_audio_input_mode": "reference_manifest" if reference else "none",
+        "director_shot_image_support": (
+            "direct_references" if reference else "optional"
+        ),
         "director_endpoint_continuity": False,
         "custom_settings": [],
         "runtime_custom_settings": [],

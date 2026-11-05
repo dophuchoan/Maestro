@@ -75,6 +75,11 @@ class DialogueWhitespaceTests(unittest.TestCase):
                               '<Subject 2> (S2) says in the voice referenced from <Audio 2>', 1)
         self.assertFalse(llm_service._h3_ref2va_dialogue_binding_contract_satisfied(SOURCE, draft, INVENTORY))
 
+    def test_matching_vocal_id_cannot_hide_a_different_visible_character(self):
+        draft = DRAFT.replace('<Subject 1> (S1) says in the voice referenced from <Audio 1>',
+                              '<Subject 2> (S1) says in the voice referenced from <Audio 1>', 1)
+        self.assertFalse(llm_service._h3_ref2va_dialogue_binding_contract_satisfied(SOURCE, draft, INVENTORY))
+
     def test_full_enhancement_keeps_safe_whitespace_draft_without_repairs(self):
         with patch.object(llm_service, 'generate', return_value=DRAFT) as writer, patch(
             'services.enhance_guides.get_enhance_guide', return_value='Write a six-field H3 reference prompt.',
@@ -126,6 +131,35 @@ class AuthoritativeReferenceInputsTests(unittest.TestCase):
         for references in ('not a list', [{'type': 'image'}], [{'type': 'invalid', 'path': 'ref.png'}]):
             with self.subTest(references=references), self.assertRaises(ValueError):
                 canonical_h3_enhancement_inputs(SOURCE, references)
+
+    def test_character_videos_and_their_voices_do_not_claim_the_scene_picture(self):
+        refs = [{"type": "image", "path": "room.png", "role": "Room", "image_intent": "scene"}]
+        for name in ("Rhea", "Noah", "Lin"):
+            refs.append({"type": "video", "path": name + ".mp4", "role": name,
+                         "video_intent": "character", "video_audio_role": "voice", "has_audio": True})
+        original = deepcopy(refs)
+        with patch('services.h3_reference_audio.measure_video_audio_metadata', side_effect=deepcopy):
+            result = canonical_h3_enhancement_inputs('Rhea greets Noah while Lin enters the room.', refs)
+        manifest = llm_service._parse_h3_ref2va_subject_manifest(result['reference_context'])
+        self.assertEqual([subject['name'] for subject in manifest], ['Rhea', 'Noah', 'Lin'])
+        for index, subject in enumerate(manifest, 1):
+            self.assertEqual(subject['index'], index)
+            self.assertEqual(subject['pictures'], [])
+            self.assertEqual(subject['videos'], [f'<Video {index}>'])
+            self.assertEqual(subject['audios'], [f'<Audio {index}>'])
+        self.assertIn('<Subject 4> is the environment and location for Room, defined by <Picture 1>',
+                      result['reference_context'])
+        self.assertEqual(refs, original, 'Preparing writer context never changes the selected reference roles')
+
+    def test_motion_videos_and_legacy_audio_are_not_silently_promoted_to_characters(self):
+        refs = [{"type": "image", "path": "room.png", "role": "Room", "image_intent": "scene"},
+                {"type": "video", "path": "rhea.mp4", "role": "Rhea", "has_audio": True}]
+        with patch('services.h3_reference_audio.measure_video_audio_metadata', side_effect=deepcopy):
+            result = canonical_h3_enhancement_inputs('Rhea speaks in the room.', refs)
+        self.assertEqual(llm_service._parse_h3_ref2va_subject_manifest(result['reference_context']), [])
+        self.assertIn('<Subject 1> is the environment and location', result['reference_context'])
+        self.assertIn('<Video 1> provides motion', result['reference_context'])
+        self.assertIn('<Audio 1> is the soundtrack paired with <Video 1>', result['reference_context'])
 
 
 if __name__ == '__main__':

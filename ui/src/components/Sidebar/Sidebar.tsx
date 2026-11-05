@@ -27,6 +27,7 @@ import { VoiceRefSection } from './VoiceRefSection'
 import { ToolsPanel } from './ToolsPanel'
 import { HardwareStatusBar } from './HardwareStatusBar'
 import { VideoWorkflowSelector } from './VideoWorkflowSelector'
+import { ComfyUIEngineControl } from './ComfyUIEngineControl'
 import { ImageWorkflowSelector } from './ImageWorkflowSelector'
 import { ImageWorkflowControls } from './ImageWorkflowControls'
 import { ControlVideoSection } from './ControlVideoSection'
@@ -90,7 +91,9 @@ export function Sidebar({ onOpenWorlds, embedded = false }: { onOpenWorlds?: () 
     let focusFrame = 0
     const resize = () => {
       const input = document.activeElement
-      const editing = sidebarOpen && !!sidebarElement?.contains(input) && isKeyboardInput(input)
+      const insideKeyboardSurface = !!sidebarElement?.contains(input)
+        || !!input?.closest('[data-sidebar-overlay]')
+      const editing = sidebarOpen && insideKeyboardSurface && isKeyboardInput(input)
       // Browser chrome and restored tabs can leave innerHeight much taller
       // than the visible page without a keyboard. Measure the actual viewport
       // while idle, retaining that baseline only during text entry. This also
@@ -280,6 +283,9 @@ export function Sidebar({ onOpenWorlds, embedded = false }: { onOpenWorlds?: () 
         {isVideoWorkspace && <VideoWorkflowSelector onOpenWorlds={onOpenWorlds} />}
         {isImageWorkspace && <ImageWorkflowSelector />}
         {isAudioWorkspace && <AudioSubModeToggle />}
+        {(isVideoWorkspace || isImageWorkspace || isAudioWorkspace) && (
+          <ComfyUIEngineControl modelType={selectedModel?.model_type || ''} kind={isImageWorkspace ? 'image' : isAudioWorkspace ? 'audio' : 'video'} />
+        )}
       </div>}
       {isTitles ? (
         <Suspense fallback={<p role="status" className="m-3 text-xs text-text-muted">Loading Titles…</p>}>

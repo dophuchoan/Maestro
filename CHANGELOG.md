@@ -14,7 +14,34 @@ pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
   branch tree. Extend the repository guard to reject private notes, local
   configuration and runtime artifacts without printing their contents.
 
-## [4.0.0] - 2026-10-29–30 — Dev release candidate
+## [4.0.0] — 2026-11-04
+
+Public Main and Dev release. Experimental features and validation limits remain
+documented in the [release notes](docs/RELEASE_NOTES_V4.0.0.md).
+
+**4 November — Release preparation and reliability:** add optional ComfyUI
+model-folder reuse, typed API workflow imports, component pickers and explicit
+Native/Comfy routing, including supported Director paths. ComfyUI remains
+separately managed and off by default. Fix wrapped H3 encoder namespaces,
+Director scene-image handling with no image-generation model, selected join
+codecs/containers, suspended preview recovery and several runtime name errors.
+Reference enhancement now distinguishes character, motion and scene videos,
+keeps vocal IDs separate from Subject IDs, and preserves authored speech when
+repairing a rejected draft. Recover a narrowly identifiable final dialogue-tag
+typo, avoid shorter automatic word targets for supplied lines, keep named props
+from stealing dialogue ownership, and include actual failures in repair requests.
+Update the README image and release documentation.
+
+**2 November — Agent Access and testing updates:** built-in Local MCP and
+authenticated Remote MCP can be enabled independently. Add scoped clients,
+model-aware authoring guides, saved references, asset transfers and agent-authored
+Studio/Director plans, including native song analysis for music videos. Existing
+Pinokio and LAN browser access remains available. Pika References now accepts
+exact source-audio conditioning; fix independent-shot offsets, character-label
+bindings and native Director module identity. Add experimental FastH3 LoRAs,
+shared Turbo LoRA filters, failed-job settings/LoRA details, speech chunk status,
+shorter Editor tracks and an adjustable timeline divider. Keep checkpoint-table
+compatibility fitting on CPU even under a different global tensor device.
 
 Label public Dev v4.0.0 in preparation for the next public Main release.
 The first visit to v4 switches existing and new browser profiles to Graphite
@@ -33,14 +60,14 @@ sliding windows with generated motion/boundary/stereo-audio history and
 canonical References inputs, fixed six-evaluation sampling and exact joined
 frame totals. Preserve saved sequence geometry and native single-pass durations.
 
-The candidate also includes the post-Main v3.3 ports and fixes: MOSS reference
+The release also includes the post-Main v3.3 ports and fixes: MOSS reference
 editors/caches/HQ vision, Fibo 2.0, Qwen reference caches, H3 accelerators/PTD/
 two-pass generation, FlashVSR+ Turbo, optional kernels, Worlds and Profile 0.
 Image prompt guides preserve requested media/styles, model-switch validation
 is repaired, and successful HTTP access lines are quiet by default.
 
-Main promotion awaits separate review of the three-workstation qualification.
-See the [v4.0.0 candidate notes and limits](docs/RELEASE_NOTES_V4.0.0.md).
+See the [v4.0.0 release notes and limits](docs/RELEASE_NOTES_V4.0.0.md) for the
+reviewed three-workstation qualification and later regression coverage.
 
 **31 October — Reference enhancement fixes:** use the selected media's character
 and voice bindings consistently in Enhance Now, Enhance on generation, and H3

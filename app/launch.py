@@ -15,6 +15,13 @@ Environment variables:
 
 import gc
 import sys
+
+# Native Pinokio starts this file as __main__. Director's callbacks import
+# launch, so publish that same module before bootstrap creates job/auth state.
+# Importing a second copy would re-register the live Agent Access backend.
+if __name__ == "__main__":
+    sys.modules["launch"] = sys.modules[__name__]
+
 import os
 import glob
 import json
@@ -397,6 +404,8 @@ from services.job_lifecycle import (
     update_job,
 )
 
+from services.generation_details import is_terminal_studio_failure, public_generation_details
+from services.lora_acceleration import is_acceleration_lora
 from services.studio_enhancement import (
     StudioJobArchive, current_settings as enhancement_settings,
     captured_settings, enhancement_context, enhancement_warnings, record_review_warning,
@@ -425,11 +434,180 @@ def _consume_generation_preview(job_id: str, payload: dict, model_type: str) -> 
             job_id, "Live previews are unavailable for this render. Generation will continue.",
         )
 
+from services.agent_access.backend import (
+    AgentAccessBackend,
+    create_router as _create_agent_access_router,
+    is_restricted_agent as _is_restricted_agent,
+    strip_private_director_fields as _strip_private_director_fields,
+)
+from services.agent_access.boundary import AccessBoundary
+from services.agent_access.context import principal_context
+from services.agent_access.state import RuntimeState
+
+_AGENT_QUEUE_PENDING_STATUSES = frozenset({"held", "queued", "running"})
+_AGENT_QUEUE_TERMINAL_STATUSES = frozenset({"cancelled", "canceled", "complete", "completed", "done", "error", "failed", "finished", "interrupted", "stopped", "success", "succeeded"})
+
+_agent_access_runtime = RuntimeState(
+    Path(_app_dir) / "settings" / "agent-access",
+    app_root=Path(_app_dir),
+)
+
+
+def _agent_configured_media_roots():
+    configured = Path(str(wgp.server_config.get("save_path") or "outputs")).expanduser()
+    return [(configured if configured.is_absolute() else Path(_app_dir) / configured).resolve()]
+
+
+_agent_access_backend = AgentAccessBackend(
+    _agent_access_runtime,
+    _app_dir,
+    additional_media_roots=_agent_configured_media_roots,
+)
+
 _studio_job_archive = StudioJobArchive(Path(_app_dir) / "settings" / "studio_queue")
-_jobs: dict = _studio_job_archive.recover()
+_jobs: dict = _agent_access_backend.registry(_studio_job_archive.recover())
+
+
+def _agent_require_job_access(job_id: str) -> None:
+    _agent_access_backend.require_job_access(job_id)
+
+
+def _agent_access_idle_probe() -> dict:
+    try:
+        _init_pipeline()
+        import services.director_pipeline as _director_state
+
+        with _director_state._pipeline_lock:
+            pipeline_snapshot = [
+                {"status": record.get("status")} if isinstance(record, dict) else record
+                for record in _director_state._pipelines.values()
+            ]
+        if _director_state.any_pipeline_active():
+            pipeline_snapshot.append({"status": "running"})
+        queue_snapshot = _director_state.list_director_queue(
+            wgp.server_config.get("save_path", "outputs")
+        )
+        return AgentAccessBackend.idle_evidence(
+            jobs=_jobs,
+            engine_lock=_gen_lock,
+            active_states=_active_gen_states,
+            director_pipelines=pipeline_snapshot,
+            director_queue=queue_snapshot,
+            active_pipeline_statuses=tuple(_director_state._ACTIVE_PIPELINE_STATUSES),
+        )
+    except Exception:
+        return {"idle": False, "certain": False, "reason": "Backend busy state could not be verified"}
+
+
+def _agent_require_director_pipeline(pid: str, record: dict | None = None) -> None:
+    principal = principal_context.get()
+    if not _is_restricted_agent(principal):
+        return
+    if _agent_access_backend.can_access_resource("pipeline", pid, principal):
+        return
+    _init_pipeline()
+    import services.director_pipeline as _director_state
+
+    source = record
+    if source is not None:
+        params = source.get("params") if isinstance(source.get("params"), dict) else {}
+        if not params and not source.get("queue_entry_id"):
+            source = None
+    if source is None:
+        source = _director_state.get_pipeline(pid)
+    if source is None:
+        source = _director_state.load_pipeline_state(
+            wgp.server_config.get("save_path", "outputs"), pid,
+        )
+    source = source if isinstance(source, dict) else {}
+    params = source.get("params") if isinstance(source.get("params"), dict) else {}
+    queue_id = params.get("_director_queue_entry_id") or source.get("queue_entry_id")
+    _agent_access_backend.inherit_pipeline_queue_owner(pid, queue_id)
+    _agent_access_backend.require_resource_access("pipeline", pid, principal)
+
+
+def _agent_require_queue_collection(queue_state: dict, statuses=None) -> None:
+    principal = principal_context.get()
+    if not _is_restricted_agent(principal):
+        return
+    entries = queue_state.get("entries") if isinstance(queue_state, dict) else None
+    if not isinstance(entries, list):
+        raise HTTPException(503, "Director queue ownership could not be verified")
+    status_set = set(statuses or ())
+    ids = []
+    known_statuses = _AGENT_QUEUE_PENDING_STATUSES | _AGENT_QUEUE_TERMINAL_STATUSES
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise HTTPException(503, "Director queue ownership could not be verified")
+        entry_id = entry.get("id")
+        status = str(entry.get("status") or "").casefold()
+        if not isinstance(entry_id, str) or not entry_id or status not in known_statuses:
+            raise HTTPException(503, "Director queue ownership could not be verified")
+        if not status_set or status in status_set:
+            ids.append(entry_id)
+    _agent_access_backend.require_collection_access("queue", ids, principal)
+
+
+def _agent_filter_director_queue(queue_state: dict) -> dict:
+    result = dict(queue_state)
+    entries = result.get("entries")
+    principal = principal_context.get()
+    if _is_restricted_agent(principal) and isinstance(entries, list):
+        visible = []
+        hidden_busy = False
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = entry.get("id")
+            if isinstance(entry_id, str) and _agent_access_backend.can_access_resource("queue", entry_id, principal):
+                visible.append(entry)
+            elif str(entry.get("status") or "").casefold() in {"held", "queued", "running"}:
+                hidden_busy = True
+        result["entries"] = visible
+        result["other_work_pending"] = hidden_busy
+    return result
+
+
+from services.agent_access.native_creative import make_native_creative_service
+
+_agent_creative_service = make_native_creative_service(
+    _agent_access_backend,
+    models=lambda: _agent_creation_models(),
+    model_def=lambda model: _agent_creation_model_def(model),
+    defaults=lambda model: _agent_creation_model_defaults(model),
+    options=lambda model: _agent_creation_model_options(model),
+    preferences=lambda: _studio_preferences_response(),
+    hardware=lambda: _get_cached_hardware(),
+    lora_hint=lambda model, loras: _active_lora_hint(model, loras),
+    injected_keyframes=lambda params: _h3_injected_keyframes_from_body(params),
+    mature_mode=lambda: bool(wgp.server_config.get("services", {}).get("nsfw_mode")),
+    probe_audio=lambda path: _probe_audio_duration(path),
+)
+
+api.include_router(_create_agent_access_router(
+    _agent_access_backend,
+    prepare_generation=lambda body, **kwargs: _prepare_generation_submission(body, **kwargs),
+    native_upload=lambda request, file, **kwargs: upload_image(request, file, **kwargs),
+    idle_probe=lambda: _agent_access_idle_probe(),
+    creative=_agent_creative_service,
+    native_director=lambda body: _start_director_pipeline_payload(body),
+))
+
+
 register_terminal_listener(_studio_job_archive.save)
 register_terminal_listener(lambda job, status: _generation_previews.clear(str(job.get("id") or "")))
+
+
+def _persist_agent_terminal_job(job: dict, _status: str) -> None:
+    try:
+        _agent_access_backend.snapshot_job(str(job.get("id") or ""))
+    except Exception:
+        pass
+
+
+register_terminal_listener(_persist_agent_terminal_job)
 _studio_submission_lock = threading.RLock()
+_agent_queue_submission_lock = asyncio.Lock()
 _gen_lock = threading.Lock()
 configure_generation_probe_lock(_gen_lock)
 
@@ -610,7 +788,8 @@ _pipeline_initialized = False
 def _init_pipeline():
     global _pipeline_initialized
     if not _pipeline_initialized:
-        from services.director_pipeline import init as pipeline_init
+        import services.director_pipeline as _director_state
+        pipeline_init = _director_state.init
         pipeline_init(
             _jobs,
             _run_generation,
@@ -619,7 +798,75 @@ def _init_pipeline():
             _active_gen_states,
             terminal_callback=_on_director_pipeline_terminal,
             queue_terminal_callback=_on_director_queue_terminal,
+            prepare_generation_engine=lambda params: _comfy_adapter.capture_engine(params),
         )
+        original_start_worker = _director_state._start_pipeline_worker
+        if not getattr(original_start_worker, "_agent_access_owner_hook", False):
+            def _start_pipeline_worker_with_agent_owner(pid, *args, **kwargs):
+                principal_id = None
+                session_id = None
+                queue_id = None
+                changed = False
+                with _director_state._pipeline_lock:
+                    pipeline = _director_state._pipelines.get(pid)
+                    params = pipeline.get("params") if isinstance(pipeline, dict) else None
+                    if isinstance(params, dict):
+                        principal_id = params.pop("_agent_access_owner_id", None)
+                        session_id = params.pop("_agent_access_session_id", None)
+                        queue_id = params.get("_director_queue_entry_id")
+                        changed = principal_id is not None or session_id is not None
+                owner = None
+                try:
+                    if isinstance(principal_id, str) and principal_id:
+                        queue_session_id = session_id or _agent_access_backend.session_id
+                        if isinstance(queue_id, str) and queue_id:
+                            _agent_access_backend.journal.register_resource_owner(
+                                "queue", queue_id, principal_id, queue_session_id,
+                            )
+                        owner = {
+                            "principal_id": principal_id,
+                            "session_id": _agent_access_backend.session_id,
+                        }
+                    elif isinstance(queue_id, str) and queue_id:
+                        existing_pipeline_owner = _agent_access_backend.journal.resource_owner("pipeline", pid)
+                        if existing_pipeline_owner is not None:
+                            # Resuming a durable pipeline keeps its original immutable
+                            # owner/session; child jobs still belong to this process run.
+                            owner = existing_pipeline_owner
+                        else:
+                            queue_owner = _agent_access_backend.journal.resource_owner("queue", queue_id)
+                            if queue_owner is not None:
+                                owner = {
+                                    "principal_id": queue_owner["principal_id"],
+                                    "session_id": _agent_access_backend.session_id,
+                                }
+                    if owner is not None:
+                        _agent_access_backend.journal.register_resource_owner(
+                            "pipeline", pid, owner["principal_id"], owner.get("session_id"),
+                        )
+                except Exception:
+                    if (
+                        owner is not None
+                        or (isinstance(principal_id, str) and principal_id)
+                        or (isinstance(queue_id, str) and queue_id)
+                    ):
+                        with _director_state._pipeline_lock:
+                            pipeline = _director_state._pipelines.get(pid)
+                            if isinstance(pipeline, dict):
+                                pipeline.update(
+                                    status="failed",
+                                    phase="failed",
+                                    error="Could not persist Director ownership",
+                                    _completed_at=time.time(),
+                                )
+                        _director_state._save_pipeline_state(pid)
+                    raise
+                if changed:
+                    _director_state._save_pipeline_state(pid)
+                return original_start_worker(pid, *args, **kwargs)
+
+            _start_pipeline_worker_with_agent_owner._agent_access_owner_hook = True
+            _director_state._start_pipeline_worker = _start_pipeline_worker_with_agent_owner
         _pipeline_initialized = True
 
 
@@ -875,6 +1122,7 @@ def list_models():
             # nsfw_mode toggle can show/hide without reloading models.
             "nsfw_only": bool(md.get("nsfw_only", False)),
             "loras_disabled": bool(md.get("loras_disabled", False)),
+            "experimental_loras_available": bool(md.get("experimental_loras_available", False)),
         })
 
     return {"families": families, "models": models}
@@ -1547,7 +1795,7 @@ def get_defaults(model_type: str):
     """Get default settings for a model type."""
     if wgp.get_model_def(model_type) is None:
         raise HTTPException(status_code=404, detail=f"Unknown model: {model_type}")
-    defaults = wgp.get_default_settings(model_type)
+    defaults = wgp.get_default_settings(model_type, persist_missing=False)
     return defaults
 
 
@@ -1555,6 +1803,40 @@ def get_defaults(model_type: str):
 def get_primary_settings():
     """Get the base primary_settings (all parameter defaults)."""
     return wgp.primary_settings
+
+
+def _agent_creation_models():
+    """Include Studio's virtual SFX model without inventing registry models."""
+    result = list_models()
+    if not wgp.server_config.get("services", {}).get("nsfw_mode"):
+        result["models"] = [model for model in result["models"] if not model.get("nsfw_only")]
+    required = [
+        "mmaudio/" + wgp.MMAUDIO_STANDARD,
+        "mmaudio/synchformer_state_dict.pth", "mmaudio/v1-44.pth",
+        "DFN5B-CLIP-ViT-H-14-378/open_clip_config.json",
+        "DFN5B-CLIP-ViT-H-14-378/open_clip_pytorch_model.bin",
+        "bigvgan_v2_44khz_128band_512x/config.json",
+        "bigvgan_v2_44khz_128band_512x/bigvgan_generator.pt",
+    ]
+    downloaded = all(wgp.fl.locate_file(path, error_if_none=False) for path in required)
+    result["models"].append({"model_type": "mmaudio_v2", "name": "MMAudio v2", "family": "tts", "architecture": "mmaudio", "is_downloaded": bool(downloaded)})
+    return result
+
+
+def _agent_creation_model_def(model):
+    if model == "mmaudio_v2":
+        return {"architecture": "mmaudio", "audio_only": True, "duration_slider": {"min": 1, "max": 20, "default": 10}, "prompt_infos": "Write sound effects, ambience and their audible timing; no lyrics or spoken narration unless explicitly requested."}
+    return wgp.get_model_def(model)
+
+
+def _agent_creation_model_defaults(model):
+    if model == "mmaudio_v2":
+        return {"sfx_mode": True, "duration_seconds": 10, "num_inference_steps": 25, "guidance_scale": 4.5, "batch_size": 1, "repeat_generation": 1}
+    return wgp.get_default_settings(model, persist_missing=False)
+
+
+def _agent_creation_model_options(model):
+    return _agent_creation_model_def(model) if model == "mmaudio_v2" else get_model_options(model)
 
 
 @api.get("/api/v1/loras/scan-status/{scan_id}")
@@ -2220,6 +2502,7 @@ def list_all_installed_loras():
                 except Exception:
                     pass
             info.update(lora_date_fields(full_path, meta))
+            info["is_acceleration"] = is_acceleration_lora(f, meta)
             # Check for local preview files (downloaded from HF)
             if not info.get("preview_url"):
                 for _b in _bases:
@@ -2376,10 +2659,18 @@ def _lora_is_compatible_with_model(model_def: dict, path: str) -> bool:
     # adapter is tied to one checkpoint shape.
     architecture = str((model_def or {}).get("architecture") or "")
     if architecture.startswith("minimax_h3"):
-        if (model_def or {}).get("minimax_h3_fused_turbo", False):
-            from models.minimax_h3.fused_turbo import fused_h3_lora_incompatibility
+        if (model_def or {}).get("minimax_h3_fasth3"):
+            from models.minimax_h3.lora_compatibility import fasth3_lora_incompatibility
 
-            return fused_h3_lora_incompatibility(path) is None
+            return fasth3_lora_incompatibility(
+                path, omni_reference=bool(model_def.get("minimax_h3_fasth3_omniref")),
+            ) is None
+        from models.minimax_h3.lora_compatibility import minimax_h3_lora_incompatibility
+
+        if minimax_h3_lora_incompatibility(model_def, path) is not None:
+            return False
+        if (model_def or {}).get("minimax_h3_fused_turbo", False):
+            return True
         from models.minimax_h3.turbo import (
             minimax_h3_adapter_workflow,
             minimax_h3_turbo_preset_for_path,
@@ -2398,6 +2689,23 @@ def _lora_is_compatible_with_model(model_def: dict, path: str) -> bool:
                 return False
             return True
     return True
+
+
+def _validate_h3_lora_selection(model_def: dict, params: dict) -> None:
+    """Catch known adapter/model mismatches before starting expensive loading."""
+    from models.minimax_h3.lora_compatibility import validate_fasth3_loras, validate_minimax_h3_loras
+
+    paths = [
+        wgp.resolve_lora_path(params["model_type"], name) or name
+        for name in params.get("activated_loras") or []
+    ]
+    if model_def.get("minimax_h3_fasth3"):
+        validate_fasth3_loras(
+            paths, enabled=params.get("minimax_h3_experimental_loras"),
+            omni_reference=bool(model_def.get("minimax_h3_fasth3_omniref")),
+        )
+    else:
+        validate_minimax_h3_loras(paths, model_def)
 
 
 def _minimax_h3_turbo_option(model_def: dict) -> dict | None:
@@ -2649,6 +2957,7 @@ def list_loras_details(model_type: str):
             except Exception:
                 meta = None
         info.update(lora_date_fields(f, meta))
+        info["is_acceleration"] = is_acceleration_lora(basename, meta)
         # Fallback: infer NSFW from filename + tags + description + guide
         # only when no authoritative signal exists.
         has_override = isinstance(meta, dict) and isinstance(meta.get("nsfw_override"), bool)
@@ -2709,6 +3018,7 @@ def list_loras_details(model_type: str):
                 loras.append(info)
             info.update({
                 "managed": True,
+                "is_acceleration": True,
                 "managed_channel": preset["status"],
                 "recommended_weights": {
                     "source": "default",
@@ -6552,7 +6862,7 @@ def get_model_options(model_type: str):
 
     # Get ui_defaults for fallback values (model handlers set these for their UIs)
     try:
-        _ui_defaults = wgp.get_default_settings(model_type) or {}
+        _ui_defaults = wgp.get_default_settings(model_type, persist_missing=False) or {}
     except Exception:
         _ui_defaults = {}
 
@@ -6750,6 +7060,7 @@ def get_model_options(model_type: str):
         "minimax_h3_fasth3_omniref": md.get("minimax_h3_fasth3_omniref", False),
         "minimax_h3_full_checkpoint": md.get("minimax_h3_full_checkpoint", False),
         "loras_disabled": md.get("loras_disabled", False),
+        "experimental_loras_available": md.get("experimental_loras_available", False),
         "minimax_h3_runtime_advisory": _minimax_h3_runtime_advisory(md),
         "minimax_h3_media_sources": md.get(
             "minimax_h3_media_sources", False
@@ -7413,6 +7724,111 @@ def scan_model_folders():
 
 from services.active_downloads_api import create_router as _active_downloads_router
 api.include_router(_active_downloads_router())
+
+
+# ComfyUI is an optional external executor. Its requests use the same durable,
+# owned jobs and GPU admission slot as native generation; it is never imported
+# into the model environment or enabled during startup.
+from services.comfyui_api import create_router as _create_comfyui_router
+from services.comfyui_integration import ComfyJobAdapter, resolve_workflow_media
+from services.comfyui_runtime import ServiceError as _ComfyServiceError
+
+
+def _comfy_workspace_dir(workspace):
+    base = Path(_workspace_dir("default")).resolve()
+    candidate = base if workspace == "default" else (base / workspace).resolve()
+    if candidate != base and base not in candidate.parents:
+        raise _ComfyServiceError(422, "The ComfyUI workspace is outside Maestro's output library.")
+    return _workspace_dir(workspace)
+
+
+def _comfy_link_folders(paths):
+    current = _get_linked_model_folders()
+    merged = list(dict.fromkeys([*current, *paths]))
+    prepared = _validate_linked_model_folders(merged)
+    result = _apply_linked_model_folders(merged, prepared=prepared)
+    with open(wgp.server_config_filename, "w", encoding="utf-8") as file:
+        json.dump(wgp.server_config, file, indent=4)
+    return result
+
+
+def _comfy_known_assets():
+    # Names are only hints, not compatibility proof. Only explicit size+SHA
+    # metadata can authorize a verified-native result in the model scanner.
+    from urllib.parse import unquote, urlsplit
+    found = {}
+    budget = [20000]
+    def walk(value, depth=0):
+        budget[0] -= 1
+        if depth > 12 or budget[0] < 0:
+            return
+        if isinstance(value, dict):
+            filename = value.get("filename") or value.get("file_name")
+            if isinstance(filename, str) and filename.lower().endswith((".safetensors", ".gguf")):
+                record = {"filename": os.path.basename(filename)}
+                hashes = value.get("hashes") or {}
+                digest = value.get("sha256") or (hashes.get("SHA256") if isinstance(hashes, dict) else None)
+                size = value.get("size_bytes") or value.get("file_size")
+                if isinstance(digest, str) and len(digest) == 64 and type(size) is int:
+                    record.update(expected_sha256=digest.lower(), expected_size=size)
+                found[(record["filename"], record.get("expected_sha256"))] = record
+            for item in value.values():
+                walk(item, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, depth + 1)
+        elif isinstance(value, str) and value.startswith("https://"):
+            filename = os.path.basename(unquote(urlsplit(value).path))
+            if filename.lower().endswith((".safetensors", ".gguf")):
+                found.setdefault((filename, None), {"filename": filename})
+    walk(getattr(wgp, "models_def", {}))
+    return list(found.values())
+
+
+def _comfy_authorize_media(value):
+    principal = principal_context.get()
+    if principal is None or getattr(principal, "owner", False):
+        return value
+    try:
+        return str(_agent_access_backend.asset_store.resolve(principal.id, value))
+    except Exception:
+        reference = _agent_access_backend.asset_store.reference_for_path(principal.id, value)
+        if reference is None:
+            raise _ComfyServiceError(403, "Use a media asset imported by this agent; another client's local paths cannot be used.") from None
+        return str(_agent_access_backend.asset_store.resolve(principal.id, reference))
+
+
+def _comfy_release_native_models():
+    # Called only by a worker that already owns _gen_lock.
+    if getattr(wgp, "wan_model", None) is not None or getattr(wgp, "offloadobj", None) is not None:
+        wgp.release_model()
+    from services.generation_memory import release_auxiliary_models
+    release_auxiliary_models()
+    try:
+        from services import llm_service
+        if llm_service.is_loaded():
+            llm_service.unload_model()
+    except Exception as error:
+        print(f"[ComfyUI] Auxiliary writer cleanup: {type(error).__name__}")
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+_comfy_adapter = ComfyJobAdapter(
+    _app_dir, jobs=_jobs, workspace_dir=_comfy_workspace_dir,
+    start_worker=lambda job_id: threading.Thread(target=_run_generation, args=(job_id,), daemon=False, name="maestro_comfyui").start(),
+    require_job_access=_agent_require_job_access,
+    principal_id=lambda: getattr(principal_context.get(), "id", None),
+    link_folders=_comfy_link_folders, known_assets=_comfy_known_assets,
+    resolve_media=lambda raw, workspace: resolve_workflow_media(_app_dir, wgp.server_config.get("save_path", "outputs"), raw, workspace),
+    authorize_media=_comfy_authorize_media,
+    is_owner=lambda: principal_context.get() is None or getattr(principal_context.get(), "owner", False),
+    finish_job=finish_job, update_job=update_job, is_cancelled=is_cancel_requested,
+    unload_native=_comfy_release_native_models,
+)
+api.include_router(_create_comfyui_router(_comfy_adapter.service))
 
 
 @api.post("/api/v1/downloads/cancel")
@@ -10679,24 +11095,47 @@ def director_queue_list():
     _init_pipeline()
     from services.director_pipeline import list_director_queue
     base = wgp.server_config.get("save_path", "outputs")
-    return list_director_queue(base)
+    return _agent_filter_director_queue(list_director_queue(base))
 
 
 @api.post("/api/v1/director/queue")
 async def director_queue_add(request: Request):
     """Freeze a Director project revision in the held queue."""
     _init_pipeline()
-    from services.director_pipeline import enqueue_director_pipeline
+    from services.director_pipeline import enqueue_director_pipeline, list_director_queue
     body = await request.json()
     params = body.get("params") if isinstance(body, dict) else None
     if not isinstance(params, dict):
         raise HTTPException(status_code=400, detail="Director queue params are required")
+    params = _strip_private_director_fields(params)
+    principal = principal_context.get()
+    if isinstance(getattr(principal, "id", None), str):
+        params["_agent_access_owner_id"] = principal.id
+        params["_agent_access_session_id"] = _agent_access_backend.session_id
     base = wgp.server_config.get("save_path", "outputs")
     try:
         # Freezing a project can copy a full music track and many references.
         # Keep that durable snapshot work off FastAPI's event loop so status,
         # cancel, and system-stat requests remain responsive.
-        return await asyncio.to_thread(enqueue_director_pipeline, base, params)
+        async with _agent_queue_submission_lock:
+            before = list_director_queue(base)
+            previous_ids = {
+                str(entry.get("id")) for entry in before.get("entries", [])
+                if isinstance(entry, dict) and entry.get("id")
+            }
+            result = await asyncio.to_thread(enqueue_director_pipeline, base, params)
+            new_ids = [
+                str(entry.get("id")) for entry in result.get("entries", [])
+                if isinstance(entry, dict) and entry.get("id") and str(entry.get("id")) not in previous_ids
+            ]
+            principal = principal_context.get()
+            if len(new_ids) == 1:
+                _agent_access_backend.bind_queue_owner(
+                    new_ids[0], getattr(principal, "id", None),
+                )
+            elif _is_restricted_agent(principal):
+                raise HTTPException(503, "Director queue ownership could not be recorded")
+            return _agent_filter_director_queue(result)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -10704,39 +11143,48 @@ async def director_queue_add(request: Request):
 @api.post("/api/v1/director/queue/start")
 def director_queue_start():
     _init_pipeline()
-    from services.director_pipeline import start_director_queue
+    from services.director_pipeline import list_director_queue, start_director_queue
     base = wgp.server_config.get("save_path", "outputs")
-    return start_director_queue(base)
+    current = list_director_queue(base)
+    _agent_require_queue_collection(current, {"held", "queued", "running"})
+    return _agent_filter_director_queue(start_director_queue(base))
 
 
 @api.post("/api/v1/director/queue/pause")
 def director_queue_pause():
     _init_pipeline()
-    from services.director_pipeline import pause_director_queue
+    from services.director_pipeline import list_director_queue, pause_director_queue
     base = wgp.server_config.get("save_path", "outputs")
-    return pause_director_queue(base)
+    current = list_director_queue(base)
+    _agent_require_queue_collection(current, {"queued", "running"})
+    return _agent_filter_director_queue(pause_director_queue(base))
 
 
 @api.post("/api/v1/director/queue/reorder")
 async def director_queue_reorder(request: Request):
     _init_pipeline()
-    from services.director_pipeline import reorder_director_queue
+    from services.director_pipeline import list_director_queue, reorder_director_queue
     body = await request.json()
     entry_ids = body.get("entry_ids") if isinstance(body, dict) else None
     if not isinstance(entry_ids, list) or not all(isinstance(item, str) for item in entry_ids):
         raise HTTPException(status_code=400, detail="entry_ids must be a list of queue IDs")
     base = wgp.server_config.get("save_path", "outputs")
-    return reorder_director_queue(base, entry_ids)
+    current = list_director_queue(base)
+    _agent_require_queue_collection(current)
+    return _agent_filter_director_queue(reorder_director_queue(base, entry_ids))
 
 
 @api.get("/api/v1/director/queue/{entry_id}")
 def director_queue_get(entry_id: str):
     _init_pipeline()
     from services.director_pipeline import get_director_queue_entry
+    _agent_access_backend.require_resource_access("queue", entry_id)
     base = wgp.server_config.get("save_path", "outputs")
     entry = get_director_queue_entry(base, entry_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Director queue entry not found")
+    if isinstance(entry.get("params"), dict):
+        entry["params"] = _strip_private_director_fields(entry["params"])
     return entry
 
 
@@ -10752,11 +11200,18 @@ async def director_queue_update(entry_id: str, request: Request):
     params = body.get("params") if isinstance(body, dict) else None
     if not isinstance(params, dict):
         raise HTTPException(status_code=400, detail="Director queue params are required")
+    params = _strip_private_director_fields(params)
+    _agent_access_backend.require_resource_access("queue", entry_id)
+    old_owner = _agent_access_backend.resource_owner("queue", entry_id)
+    if old_owner is not None:
+        params["_agent_access_owner_id"] = old_owner["principal_id"]
+        params["_agent_access_session_id"] = old_owner.get("session_id")
     base = wgp.server_config.get("save_path", "outputs")
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             update_director_queue_entry, base, entry_id, params,
         )
+        return _agent_filter_director_queue(result)
     except PipelineBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
@@ -10770,6 +11225,7 @@ def director_queue_delete(entry_id: str, completed_only: bool = False):
         PipelineBusyError,
         remove_director_queue_entry,
     )
+    _agent_access_backend.require_resource_access("queue", entry_id)
     base = wgp.server_config.get("save_path", "outputs")
     try:
         removed = remove_director_queue_entry(base, entry_id, completed_only=completed_only)
@@ -10785,19 +11241,30 @@ async def director_pipeline_start(request: Request):
 
     Runs entirely server-side so the browser can be closed.
     """
+    return await _start_director_pipeline_payload(await request.json())
+
+
+async def _start_director_pipeline_payload(body: dict):
+    """Shared submission path for browser and reviewed external authoring."""
     _init_pipeline()
     from services.director_pipeline import start_pipeline
-    body = await request.json()
+    body = _strip_private_director_fields(body)
+    principal = principal_context.get()
+    if isinstance(getattr(principal, "id", None), str):
+        body["_agent_access_owner_id"] = principal.id
+        body["_agent_access_session_id"] = _agent_access_backend.session_id
     try:
         pid = await asyncio.to_thread(start_pipeline, body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _agent_access_backend.bind_pipeline_owner(pid, getattr(principal, "id", None))
     return {"pipeline_id": pid}
 
 
 @api.get("/api/v1/director/pipeline/{pid}")
 def director_pipeline_status(pid: str):
     """Get current pipeline status with rich progress info."""
+    _agent_require_director_pipeline(pid)
     from services.director_pipeline import get_pipeline_status
     base = wgp.server_config.get("save_path", "outputs")
     p = get_pipeline_status(pid, base)
@@ -10818,6 +11285,7 @@ def director_pipeline_status(pid: str):
 @api.get("/api/v1/director/pipeline/{pid}/llm-drafts")
 def director_pipeline_drafts(pid: str):
     """Load full writer evidence only when requested, not on each status poll."""
+    _agent_require_director_pipeline(pid)
     from services.director_pipeline import get_pipeline_drafts
     drafts = get_pipeline_drafts(pid, wgp.server_config.get("save_path", "outputs"))
     if drafts is None:
@@ -10828,6 +11296,7 @@ def director_pipeline_drafts(pid: str):
 @api.post("/api/v1/director/pipeline/{pid}/continue")
 async def director_pipeline_continue(pid: str, request: Request):
     """Resume a paused pipeline, optionally with updated clip plans."""
+    _agent_require_director_pipeline(pid)
     _init_pipeline()
     from services.director_pipeline import continue_pipeline
     body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
@@ -10840,6 +11309,7 @@ async def director_pipeline_continue(pid: str, request: Request):
 @api.post("/api/v1/director/pipeline/{pid}/stop")
 def director_pipeline_stop(pid: str):
     """Cancel a running pipeline."""
+    _agent_require_director_pipeline(pid)
     from services.director_pipeline import get_pipeline, stop_pipeline
     if stop_pipeline(pid):
         current = get_pipeline(pid) or {}
@@ -10862,6 +11332,7 @@ def director_pipeline_resume(pid: str):
     before the crash, then re-runs video generation — so a mid-run backend
     crash doesn't throw away completed LLM work.
     """
+    _agent_require_director_pipeline(pid)
     _init_pipeline()
     from services.director_pipeline import resume_pipeline
     base = wgp.server_config.get("save_path", "outputs")
@@ -10879,6 +11350,20 @@ def list_saved_pipelines():
     from services.director_pipeline import list_pipeline_states
     base = wgp.server_config.get("save_path", "outputs")
     pipelines = list_pipeline_states(base)
+    principal = principal_context.get()
+    if _is_restricted_agent(principal):
+        visible = []
+        for pipeline in pipelines:
+            pipeline_id = str(pipeline.get("id") or "")
+            try:
+                _agent_require_director_pipeline(pipeline_id)
+            except HTTPException as error:
+                if error.status_code == 404:
+                    continue
+                raise
+            if _agent_access_backend.can_access_resource("pipeline", pipeline_id, principal):
+                visible.append(pipeline)
+        pipelines = visible
     for pipeline in pipelines:
         if pipeline.get("output_count") or pipeline.get("clip_count"):
             pipeline["thumbnail_url"] = (
@@ -10890,6 +11375,7 @@ def list_saved_pipelines():
 @api.get("/api/v1/director/pipelines/{pid}/thumbnail")
 def get_saved_pipeline_thumbnail(pid: str):
     """Serve a cached first frame for the Editor's Director-run gallery."""
+    _agent_require_director_pipeline(pid)
     from services.director_pipeline import build_pipeline_first_frame_thumbnail
     base = wgp.server_config.get("save_path", "outputs")
     thumbnail = build_pipeline_first_frame_thumbnail(base, pid)
@@ -10906,12 +11392,14 @@ def get_saved_pipeline(pid: str):
     state = load_pipeline_state(base, pid)
     if not state:
         return JSONResponse({"error": "Pipeline not found"}, status_code=404)
+    _agent_require_director_pipeline(pid, state)
     return state
 
 
 @api.put("/api/v1/director/pipelines/{pid}/clips/{clip_index}/tag")
 async def tag_pipeline_clip(pid: str, clip_index: int, request: Request):
     """Tag a clip as 'good', 'needs_work', or null."""
+    _agent_require_director_pipeline(pid)
     from services.director_pipeline import PipelineBusyError, update_clip_tag
     body = await request.json()
     tag = body.get("tag")
@@ -10928,6 +11416,7 @@ async def tag_pipeline_clip(pid: str, clip_index: int, request: Request):
 @api.put("/api/v1/director/pipelines/{pid}/clips/{clip_index}/prompt")
 async def save_pipeline_clip_prompt(pid: str, clip_index: int, request: Request):
     """Persist reviewed clip prompts without starting generation."""
+    _agent_require_director_pipeline(pid)
     from services.director_pipeline import PipelineBusyError, update_clip_prompt
     try:
         body = await request.json()
@@ -10952,6 +11441,7 @@ async def save_pipeline_clip_prompt(pid: str, clip_index: int, request: Request)
 @api.post("/api/v1/director/pipelines/{pid}/repair")
 def repair_saved_pipeline(pid: str):
     """Start a browser-independent missing-media repair and final rejoin."""
+    _agent_require_director_pipeline(pid)
     _init_pipeline()
     from services.director_pipeline import (
         PipelineBusyError,
@@ -10973,6 +11463,7 @@ def repair_saved_pipeline(pid: str):
 @api.post("/api/v1/director/pipelines/{pid}/repair/cancel")
 def cancel_saved_pipeline_repair(pid: str):
     """Cancel a server-owned repair and its current generation child."""
+    _agent_require_director_pipeline(pid)
     _init_pipeline()
     from services.director_pipeline import cancel_pipeline_repair
     base = wgp.server_config.get("save_path", "outputs")
@@ -10987,6 +11478,7 @@ def cancel_saved_pipeline_repair(pid: str):
 @api.post("/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-image")
 async def rerun_pipeline_clip_image(pid: str, clip_index: int, request: Request):
     """Re-generate the start image for a specific clip in a saved pipeline."""
+    _agent_require_director_pipeline(pid)
     _init_pipeline()
     from services.director_pipeline import (
         GenerationCancelledError,
@@ -11026,6 +11518,7 @@ async def rerun_pipeline_clip_image(pid: str, clip_index: int, request: Request)
 @api.post("/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video")
 async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request):
     """Re-generate the video for a specific clip in a saved pipeline."""
+    _agent_require_director_pipeline(pid)
     _init_pipeline()
     from services.director_pipeline import (
         GenerationCancelledError,
@@ -11061,6 +11554,7 @@ async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request)
 @api.post("/api/v1/director/pipelines/{pid}/rejoin")
 async def rejoin_pipeline_clips(pid: str):
     """Re-join all clips from a saved pipeline using current best versions."""
+    _agent_require_director_pipeline(pid)
     _init_pipeline()
     from services.director_pipeline import PipelineBusyError, rejoin_clips
     base = wgp.server_config.get("save_path", "outputs")
@@ -11078,6 +11572,7 @@ async def rejoin_pipeline_clips(pid: str):
 @api.delete("/api/v1/director/pipelines/{pid}")
 def delete_pipeline_endpoint(pid: str):
     """Delete a saved pipeline and all media it produced (any workspace)."""
+    _agent_require_director_pipeline(pid)
     _init_pipeline()
     from services.director_pipeline import delete_pipeline
     base = wgp.server_config.get("save_path", "outputs")
@@ -11253,6 +11748,11 @@ def _enqueue_deferred_generation_preparation(body: dict) -> dict:
     """Create a visible job before any automatic sequence planning begins."""
 
     body = deepcopy(body)
+    body.pop("_comfyui_submission", None)
+    try:
+        engine_snapshot = _comfy_adapter.capture_engine(body)
+    except _ComfyServiceError as error:
+        raise HTTPException(error.status, str(error)) from error
     correlation = _pop_editor_submission(body)
     client_submission_id = str((correlation or {}).get("client_submission_id") or "").strip()
     editor_operation_id = (correlation or {}).get("editor_operation_id")
@@ -11293,6 +11793,7 @@ def _enqueue_deferred_generation_preparation(body: dict) -> dict:
         "step": 0,
         "total_steps": 0,
         "phase": "",
+        "generation_engine_snapshot": engine_snapshot,
         "message": (
             "Ready - AI planning will run when queue starts"
             if hold_for_queue
@@ -11552,6 +12053,13 @@ async def _prepare_generation_submission(
     """Normalize/plan a request, then submit it or return prepared params."""
 
     body = dict(body)
+    # Only the trusted provider adapter may attach an existing durable intent.
+    body.pop("_comfyui_submission", None)
+    principal = principal_context.get()
+    if principal is not None and not getattr(principal, "owner", False):
+        # These IDs are written only by trusted Director route code. A grant
+        # must not claim an existing pipeline or queue entry through JSON.
+        body = _strip_private_director_fields(body)
     correlation = _pop_editor_submission(body)
     editor_operation_id = (correlation or {}).get("editor_operation_id")
     if prepare_only and editor_operation_id:
@@ -11766,6 +12274,7 @@ async def _prepare_generation_submission(
                 ),
                 workflow=minimax_h3_adapter_workflow(_generation_model_def),
             )
+            _validate_h3_lora_selection(_generation_model_def, body)
             if _generation_model_def.get("omni_reference"):
                 from models.minimax_h3.turbo import find_minimax_h3_pdd_loras
 
@@ -13019,6 +13528,13 @@ async def _prepare_generation_submission(
 
     job_id = uuid.uuid4().hex[:8]
     initial_status = "held" if hold_for_queue else "queued"
+    try:
+        engine_snapshot = _comfy_adapter.capture_engine(body)
+        existing_comfy = _comfy_adapter.attach_native(body, workspace, job_id, client_submission_id, engine_snapshot=engine_snapshot)
+    except _ComfyServiceError as error:
+        raise HTTPException(error.status, str(error)) from error
+    if existing_comfy is not None:
+        return existing_comfy
     job = {
         "id": job_id,
         "show_in_gallery": not hold_for_queue and not body.get("_viggle_prepare_only"),
@@ -13027,6 +13543,7 @@ async def _prepare_generation_submission(
         "step": 0,
         "total_steps": 0,
         "phase": "",
+        "generation_engine_snapshot": engine_snapshot,
         "message": (
             "Ready - waiting for Start Queue"
             if hold_for_queue
@@ -26754,10 +27271,15 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
             elif not try_start(job, message="Preparing..."):
                 return False
 
+            if job["params"].get("model_type") == "comfyui_workflow":
+                return _comfy_adapter.execute(job, finalize=finalize)
+            _comfy_adapter.service.assert_native_idle()
+
             # Automatic H3/LTX window planners are intentionally part of the
             # queued job. They must never load before this worker owns the
             # generation lock, otherwise a second submission can place the
             # prompt LLM beside an active diffusion model and freeze the host.
+            comfy_submission_before_planning = job["params"].get("_comfyui_submission")
             try:
                 _prepare_job_enhancement(job)
                 if is_cancel_requested(job):
@@ -26771,6 +27293,19 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                 detail = getattr(error, "detail", None) or str(error)
                 finish_job(job, "failed", error=str(detail), message=str(detail))
                 return False
+
+            if comfy_submission_before_planning:
+                job["params"]["_comfyui_submission"] = comfy_submission_before_planning
+            elif (job.get("generation_engine_snapshot") or {}).get("engine") == "comfyui":
+                existing_comfy = _comfy_adapter.attach_native(
+                    job["params"], job.get("workspace") or "default", job_id,
+                    job.get("client_submission_id"),
+                    engine_snapshot=job["generation_engine_snapshot"],
+                )
+                if existing_comfy is not None and existing_comfy["job_id"] != job_id:
+                    raise _ComfyServiceError(409, "This workflow already has an owned submission receipt: " + existing_comfy["job_id"])
+            if job["params"].get("_comfyui_submission"):
+                return _comfy_adapter.execute(job, finalize=finalize)
 
             if (not _slot_owned and job["params"].get("viggle_character")
                     and (wgp.get_model_def(job["params"].get("model_type")) or {}).get("minimax_h3_viggle")):
@@ -27144,6 +27679,15 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
 
             # Multi-clip mode: split single request into per-clip tasks
             elif raw_params.get("multi_prompts_gen_type") == 3:
+                from services.director_video_strategy import (
+                    apply_h3_clip_drive_audio,
+                    advance_director_multiclip_audio_offset,
+                    should_continue_multi_clip_task,
+                )
+                from services.director_music_timing import (
+                    music_output_frame_total,
+                )
+
                 prompt_text = raw_params.get("prompt", "")
                 prompt_lines = _split_multi_clip_prompt_text(
                     prompt_text,
@@ -27163,6 +27707,11 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                     not isinstance(per_clip_output_frames, list) or len(per_clip_output_frames) != len(prompt_lines)
                 ):
                     raise ValueError("Music output durations must match the clip count.")
+                music_output_total_frames = (
+                    music_output_frame_total(per_clip_output_frames)
+                    if per_clip_output_frames is not None
+                    else 0
+                )
                 per_clip_prompt_modes = raw_params.pop(
                     "per_clip_prompt_modes", None,
                 )
@@ -27187,6 +27736,11 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                     )
                 except (TypeError, ValueError):
                     omni_sequence_target_frames = 0
+                multi_clip_target_frames = (
+                    music_output_total_frames
+                    if music_output_total_frames > 0
+                    else omni_sequence_target_frames
+                )
                 group_id = f"mc_{int(time.time())}_{raw_params.get('seed', 0)}"
                 clip_count = max(
                     len(prompt_lines),
@@ -27297,10 +27851,11 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                             per_clip_h3_references[i]
                         )
                         clip_params["minimax_h3_runtime_references"] = clip_runtime_refs
-                        if clip_drive_audio:
-                            clip_params["audio_prompt_type"] = "AD"
-                            clip_params["audio_guide"] = clip_drive_audio
-                            clip_params["minimax_h3_exact_drive_audio_ordinal"] = clip_drive_ordinal
+                        apply_h3_clip_drive_audio(
+                            clip_params,
+                            clip_drive_audio,
+                            clip_drive_ordinal,
+                        )
                     # Set per-clip image_prompt_type based on which images are present
                     has_start = bool(clip_params.get("image_start"))
                     has_end = bool(clip_end)
@@ -27315,16 +27870,20 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                     # uses this for duration-split FL2VA segments or an
                     # explicitly planned literal continuation, never across
                     # an ordinary editorial cut.
-                    if not has_start and i > 0:
-                        bounded_continuation = bool(
-                            per_clip_continuations
-                            and i < len(per_clip_continuations)
-                            and per_clip_continuations[i]
-                        )
-                        if not _mc_bounded_director or bounded_continuation:
-                            clip_params["_continuation"] = True
-                            if bounded_continuation:
-                                clip_params["_continuation_tail_skip"] = 0
+                    bounded_continuation = bool(
+                        per_clip_continuations
+                        and i < len(per_clip_continuations)
+                        and per_clip_continuations[i]
+                    )
+                    if should_continue_multi_clip_task(
+                        clip_index=i,
+                        has_start=has_start,
+                        bounded_director=_mc_bounded_director,
+                        per_clip_continuations=per_clip_continuations,
+                    ):
+                        clip_params["_continuation"] = True
+                        if bounded_continuation:
+                            clip_params["_continuation_tail_skip"] = 0
                     clip_frames = per_clip_frames[i] if per_clip_frames and i < len(per_clip_frames) else sw_size
                     if _mc_bounded_director:
                         clip_frames = int(clip_frames)
@@ -27355,13 +27914,18 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                         trim_tail = music_output_trim(clip_frames, per_clip_output_frames[i])
                     clip_params["video_length"] = clip_frames
                     clip_params["trim_tail_frames"] = trim_tail
-                    clip_params["audio_frame_offset"] = cumulative_offset
+                    clip_audio_frame_offset = cumulative_offset
+                    clip_params["audio_frame_offset"] = clip_audio_frame_offset
                     if clip_params.get("video_guide"):
                         clip_params["video_frame_offset"] = (
                             multi_clip_video_origin_frame
                             + cumulative_offset - multi_clip_audio_origin_frame
                         )
-                    cumulative_offset += clip_frames - trim_tail  # advance by post-trim frames for audio sync
+                    cumulative_offset = advance_director_multiclip_audio_offset(
+                        clip_audio_frame_offset,
+                        clip_frames,
+                        trim_tail,
+                    )  # advance by post-trim frames for source-audio sync
                     total_trimmed_frames += trim_tail
                     clip_params["multi_clip_info"] = {
                         "group_id": group_id,
@@ -27371,7 +27935,7 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                         "audio_start_sec": multi_clip_audio_start_sec,
                         "concat_audio_path": multi_clip_concat_audio,
                         "omni_sequence_continuity": omni_sequence_continuity,
-                        "target_total_frames": omni_sequence_target_frames,
+                        "target_total_frames": multi_clip_target_frames,
                     }
                     # Director supplies the prompt mode explicitly so normal
                     # paragraph breaks cannot be mistaken for window prompts.
@@ -29420,6 +29984,9 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                 "error": str(e),
                 "message": f"Error: {e}",
             }
+            comfy_submission = (job.get("params") or {}).get("_comfyui_submission")
+            if comfy_submission:
+                _comfy_adapter.service.fail_prepared(comfy_submission, str(e))
             # Tag with OOM info — see _run_sfx_generation for rationale.
             try:
                 from services.oom_detect import detect_oom
@@ -29585,7 +30152,10 @@ def _run_recast_shot_generation(job_id):
         os.makedirs(final_out_dir, exist_ok=True)
         seed = int(shot_bundle["resolved_seed"])
         timestamp = time.strftime("%Y-%m-%d-%Hh%Mm%Ss")
-        extension = os.path.splitext(ordered_paths[0])[1] or ".mp4"
+        codec_type = wgp.server_config.get("video_output_codec", "libx264_8")
+        container = wgp.server_config.get("video_container", "mp4")
+        video_encoding = wgp.get_video_encoding(codec_type, container)
+        extension = video_encoding["extension"]
         final_path = wgp.get_available_filename(
             final_out_dir,
             f"{timestamp}_seed{seed}_recast_shot_aware{extension}",
@@ -29613,6 +30183,8 @@ def _run_recast_shot_generation(job_id):
                 float(shot_bundle["frame_count"])
                 / float(shot_bundle["fps"])
             ),
+            codec_type=video_encoding["codec_type"],
+            container=video_encoding["container"],
         )
         if is_cancel_requested(job):
             if final_path and os.path.isfile(final_path):
@@ -29836,7 +30408,10 @@ def _run_repaint_shot_generation(job_id):
         os.makedirs(final_out_dir, exist_ok=True)
         seed = int(shot_bundle["resolved_seed"])
         timestamp = time.strftime("%Y-%m-%d-%Hh%Mm%Ss")
-        extension = os.path.splitext(ordered_paths[0])[1] or ".mp4"
+        codec_type = wgp.server_config.get("video_output_codec", "libx264_8")
+        container = wgp.server_config.get("video_container", "mp4")
+        video_encoding = wgp.get_video_encoding(codec_type, container)
+        extension = video_encoding["extension"]
         final_path = wgp.get_available_filename(
             final_out_dir,
             f"{timestamp}_seed{seed}_repaint_shot_aware{extension}",
@@ -29864,6 +30439,8 @@ def _run_repaint_shot_generation(job_id):
                 float(shot_bundle["frame_count"])
                 / float(shot_bundle["fps"])
             ),
+            codec_type=video_encoding["codec_type"],
+            container=video_encoding["container"],
         )
         if is_cancel_requested(job):
             if final_path and os.path.isfile(final_path):
@@ -30115,7 +30692,10 @@ def _run_outpaint_shot_generation(job_id):
         os.makedirs(final_out_dir, exist_ok=True)
         seed = int(shot_bundle["resolved_seed"])
         timestamp = time.strftime("%Y-%m-%d-%Hh%Mm%Ss")
-        extension = os.path.splitext(ordered_paths[0])[1] or ".mp4"
+        codec_type = wgp.server_config.get("video_output_codec", "libx264_8")
+        container = wgp.server_config.get("video_container", "mp4")
+        video_encoding = wgp.get_video_encoding(codec_type, container)
+        extension = video_encoding["extension"]
         final_path = wgp.get_available_filename(
             final_out_dir,
             f"{timestamp}_seed{seed}_outpaint_shot_aware{extension}",
@@ -30146,6 +30726,8 @@ def _run_outpaint_shot_generation(job_id):
             abort_callback=lambda: is_cancel_requested(job),
             pad_audio=bool(source_audio),
             audio_duration_sec=float(expected_frames) / fps,
+            codec_type=video_encoding["codec_type"],
+            container=video_encoding["container"],
         )
         if is_cancel_requested(job):
             if final_path and os.path.isfile(final_path):
@@ -30314,6 +30896,7 @@ def _director_job_response_fields(job_snapshot: dict) -> dict:
 @api.get("/api/v1/status/{job_id}")
 def get_status(job_id: str):
     """Get generation job status."""
+    _agent_require_job_access(job_id)
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     j = snapshot_job(_jobs[job_id])
@@ -30334,6 +30917,7 @@ def get_status(job_id: str):
         "finishing_warnings": j.get("finishing_warnings", []),
         "reconstruction_report": j.get("reconstruction_report"),
         "error": j["error"],
+        "generation_details": public_generation_details(j),
         "viggle_preparation": j.get("viggle_preparation"),
         "enhancement": public_enhancement(j.get("enhancement"), summary=True),
         # Present only on failed jobs that look like CUDA OOMs. UI
@@ -30354,6 +30938,7 @@ def get_status(job_id: str):
 
 @api.get("/api/v1/jobs/{job_id}/preview/{revision}")
 def get_generation_preview(job_id: str, revision: int, request: Request):
+    _agent_require_job_access(job_id)
     job = _jobs.get(job_id)
     if not job or job.get("status") != "running" or is_cancel_requested(job):
         raise HTTPException(status_code=404, detail="Preview is no longer available")
@@ -30365,6 +30950,7 @@ def get_generation_preview(job_id: str, revision: int, request: Request):
 
 @api.get("/api/v1/jobs/{job_id}/enhancement")
 def get_job_enhancement(job_id: str):
+    _agent_require_job_access(job_id)
     job = _jobs.get(job_id)
     if not job or not job.get("enhancement"):
         raise HTTPException(404, "Enhanced job not found")
@@ -30376,6 +30962,7 @@ def get_job_enhancement(job_id: str):
 
 @api.post("/api/v1/jobs/{job_id}/retry")
 async def retry_enhanced_job(job_id: str, request: Request):
+    _agent_require_job_access(job_id)
     body = await request.json()
     action = body.get("action", "retry")
     if action not in {"retry", "refresh", "as_written", "accept_draft"}:
@@ -30439,10 +31026,14 @@ async def retry_enhanced_job(job_id: str, request: Request):
 @api.post("/api/v1/cancel/{job_id}")
 def cancel_job(job_id: str):
     """Cancel a held, queued, or running generation job."""
+    _agent_require_job_access(job_id)
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = _jobs[job_id]
+    comfy_submission = (job.get("params") or {}).get("_comfyui_submission")
+    if comfy_submission:
+        _comfy_adapter.service.cancel_prepared(comfy_submission)
     result = request_cancel(
         job,
         job_id=job_id,
@@ -30530,6 +31121,7 @@ api.include_router(create_worlds_router(
 
 @api.delete("/api/v1/jobs/{job_id}")
 def dismiss_studio_job(job_id: str):
+    _agent_require_job_access(job_id)
     job = _jobs.get(job_id)
     if not job:
         return {"dismissed": True}
@@ -30600,6 +31192,16 @@ def _start_held_studio_queue() -> list[str]:
 @api.post("/api/v1/jobs/queue/start")
 def start_studio_queue():
     """Release held Studio jobs without disturbing an active generation."""
+    principal = principal_context.get()
+    if _is_restricted_agent(principal):
+        foreign_held = [
+            job_id for job_id, job in list(_jobs.items())
+            if isinstance(job, dict)
+            and str(job.get("status") or "").casefold() == "held"
+            and not _agent_access_backend.can_access_job(job_id, principal)
+        ]
+        if foreign_held:
+            raise HTTPException(403, "The Studio queue also contains work owned by another client")
     released = _start_held_studio_queue()
     return {
         "status": "started" if released else "idle",
@@ -30613,7 +31215,12 @@ def job_by_submission(client_submission_id: str):
     """Recover an exact receipt even after a job left the active queue."""
     if not client_submission_id or len(client_submission_id) > 160:
         raise HTTPException(400, "Invalid client submission identity")
-    matches = [job for job in list(_jobs.values()) if job.get("client_submission_id") == client_submission_id]
+    principal = principal_context.get()
+    matches = [
+        job for job_id, job in list(_jobs.items())
+        if job.get("client_submission_id") == client_submission_id
+        and _agent_access_backend.can_access_job(job_id, principal)
+    ]
     if not matches:
         raise HTTPException(404, "Submission receipt not found")
     if len(matches) != 1:
@@ -30624,12 +31231,16 @@ def job_by_submission(client_submission_id: str):
 @api.get("/api/v1/jobs")
 def list_jobs():
     """List all active/recent jobs for reconnection after browser refresh."""
+    principal = principal_context.get()
+    restricted = _is_restricted_agent(principal)
     active = []
-    for job in list(_jobs.values()):
+    for job_id, job in list(_jobs.items()):
+        if restricted and not _agent_access_backend.can_access_job(job_id, principal):
+            continue
         j = snapshot_job(job)
         if j.get("dismissed"):
             continue
-        if j["status"] in ("held", "queued", "running") or j.get("enhancement") or j.get("finishing_warnings"):
+        if j["status"] in ("held", "queued", "running") or is_terminal_studio_failure(j) or j.get("enhancement") or j.get("finishing_warnings"):
             active.append({
                 "job_id": j["id"],
                 "client_submission_id": j.get("client_submission_id"),
@@ -30645,6 +31256,7 @@ def list_jobs():
                 "output_files": j["output_files"],
                 "finishing_warnings": j.get("finishing_warnings", []),
                 "error": j["error"],
+                "generation_details": public_generation_details(j),
                 "enhancement": public_enhancement(j.get("enhancement"), summary=True),
                 "oom_info": j.get("oom_info"),
                 "performance_plan": j.get("performance_plan"),
@@ -30666,7 +31278,12 @@ def list_jobs():
                 "ltx_window_plan": j.get("ltx_window_plan"),
             })
     active.sort(key=lambda x: x["created_at"])
-    return {"jobs": active}
+    global_busy = bool(
+        _gen_lock.locked()
+        or _active_gen_states
+        or any(str(job.get("status", "")).casefold() in {"held", "queued", "running"} for job in _jobs.values())
+    )
+    return {"jobs": active, "busy": global_busy}
 
 
 # ============================================================================
@@ -30978,10 +31595,11 @@ def get_output_metadata(name: str, workspace: str = ""):
 def rejoin_clips(body: dict):
     """Re-concatenate clips from a multi-clip group.
 
-    Body: { group_id: str, audio_file?: str }
+    Body: { group_id: str, audio_file?: str, video_output_codec?: str,
+            video_container?: str }
     Finds all clip files matching the group_id and re-concatenates them.
     """
-    from wgp import concatenate_multi_clip_videos
+    from wgp import concatenate_multi_clip_videos, get_video_encoding
     group_id = body.get("group_id")
     if not group_id:
         raise HTTPException(status_code=400, detail="group_id is required")
@@ -31053,7 +31671,19 @@ def rejoin_clips(body: dict):
     # Generate output path
     import time
     timestamp = time.strftime("%Y-%m-%d_%H%M%S")
-    concat_name = f"{timestamp}_rejoin_multiclip.mp4"
+    codec_type = body.get(
+        "video_output_codec",
+        wgp.server_config.get("video_output_codec", "libx264_8"),
+    )
+    container = body.get(
+        "video_container",
+        wgp.server_config.get("video_container", "mp4"),
+    )
+    try:
+        video_encoding = get_video_encoding(codec_type, container)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    concat_name = f"{timestamp}_rejoin_multiclip{video_encoding['extension']}"
     concat_path = os.path.join(out_dir, concat_name)
 
     success = concatenate_multi_clip_videos(
@@ -31061,6 +31691,8 @@ def rejoin_clips(body: dict):
         concat_path,
         audio_path,
         audio_start_sec=audio_start_sec,
+        codec_type=video_encoding["codec_type"],
+        container=video_encoding["container"],
     )
     if not success or not os.path.isfile(concat_path):
         raise HTTPException(status_code=500, detail="Concatenation failed")
@@ -32683,6 +33315,20 @@ if __name__ == "__main__":
         )
         port = resolved_port
 
+    _agent_backend_url = f"http://127.0.0.1:{port}"
+    _agent_launcher_script = os.environ.get("MAESTRO_LAUNCHER_SCRIPT", "").strip()
+    if _agent_launcher_script not in {"start.js", "start_sol.js", "start_classic.js"}:
+        _agent_launcher_script = (
+            "start_sol.js" if os.environ.get("MAESTRO_SOL_RUNTIME") == "1" else "start.js"
+        )
+    _agent_access_runtime.register_backend(
+        _agent_backend_url,
+        ready=False,
+        session_id=_agent_access_backend.session_id,
+        launcher_script=_agent_launcher_script,
+    )
+    _agent_access_backend.start_snapshotter()
+
     # Recreate the manager with the reserved port. Refresh an existing opted-in
     # route only after API startup succeeds; local startup never requires it.
     _tailscale = TailscaleManager(_maestro_settings_dir, port)
@@ -32696,6 +33342,13 @@ if __name__ == "__main__":
 
     def _announce_ready(_server):
         _tailscale.refresh_if_enabled()
+        _agent_access_runtime.register_backend(
+            _agent_backend_url,
+            ready=True,
+            session_id=_agent_access_backend.session_id,
+            launcher_script=_agent_launcher_script,
+            auth_boundary_version=3,
+        )
         print(f"\n{'='*50}")
         print(f"  Maestro UI:    http://{display_host}:{port}/")
         # Trailing slash required: the Gradio submount 404s the bare path.
@@ -32708,8 +33361,25 @@ if __name__ == "__main__":
     # Confirm the polling filter immediately before Uvicorn configures logging.
     install_quiet_access_filter()
 
+    # Preserve the native browser/LAN workflow. Agent Access management and
+    # explicit agent credentials remain protected; MCP uses its strict HTTPS
+    # controller rather than changing how existing users open the web UI.
+    _authenticated_app = AccessBoundary(
+        api,
+        runtime=_agent_access_runtime,
+        allow_local_agent_tokens=True,
+        journal=_agent_access_backend.journal,
+        app_root=Path(_app_dir),
+        asset_resolver=_agent_access_backend.asset_store.resolve_tree,
+        additional_media_roots=_agent_configured_media_roots,
+        allow_local_ui=True,
+        allow_legacy_browser=True,
+    )
+    from services.agent_access.pinokio_proxy import PinokioNativeMcpProxy
+    _authenticated_app = PinokioNativeMcpProxy(_authenticated_app, _agent_access_runtime)
+
     try:
-        run_reserved_server(api, host=host, server_socket=server_socket, on_ready=_announce_ready)
+        run_reserved_server(_authenticated_app, host=host, server_socket=server_socket, on_ready=_announce_ready)
     except OSError as e:
         print(
             f"\n[Maestro] ERROR: could not start the API on {host}:{port} ({e}). "
@@ -32717,3 +33387,8 @@ if __name__ == "__main__":
             flush=True,
         )
         sys.exit(1)
+    finally:
+        _agent_access_backend.shutdown(
+            _agent_backend_url,
+            launcher_script=_agent_launcher_script,
+        )

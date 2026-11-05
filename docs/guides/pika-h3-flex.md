@@ -29,6 +29,31 @@ Extra accelerators, control video, timed frame injection, First Block
 Cache, and Audio Refinement are unavailable. References are ordered; changing
 their order changes the request meaning.
 
+## Director availability
+
+Both Pika entries support **Story** in Director. Frames uses optional start/end
+images; References uses the project's ordered character and scene references
+directly and needs at least one image or video reference. References does not
+require a generated start image for each shot. Saved character references can
+include their separate native voice reference.
+
+**References** also supports **Music Video** and audio-driven Director. Maestro
+slices the selected soundtrack to each shot, encodes it as clean target audio,
+and holds those audio latents fixed while the six-step sampler generates video.
+The final assembly uses the original continuous soundtrack. This follows the
+audio-to-video branch in Pika's [official wrapper](https://github.com/Pika-Labs/Pika-H3-Flex/blob/main/src/pika_h3/core/wrapper.py),
+rather than generating unrelated speech and replacing it afterward.
+
+In Studio References, choose **Music / Performance** for the audio reference
+to use that exact performance. **Voice**, **Style**, and **Sound** remain
+creative reference roles; they do not lock the new video to that recording.
+At least one image or video reference is still required. The exact-drive path
+is experimental: preserving the source audio does not guarantee perfect lip sync
+or motion for every performance. Frames remains Story-only in Director.
+
+Director's **Seamless** option remains unavailable; Studio's explicit Pika
+sliding-window workflow below is a separate supported path.
+
 ### Experimental H3 LoRAs
 
 Ordinary H3 character, style and concept LoRAs can be tested in both Frames and

@@ -9,6 +9,7 @@ import { MediaTrimDialog } from '../shared/MediaTrimDialog'
 import { useStore } from '../../stores/useStore'
 import { isKreaIdentityEdit, normalizeKreaIdentitySettings } from '../../lib/kreaIdentityControls'
 import { getUploadUrl, fetchOutputMetadata, getFileUrl, moveOutput, uploadImage } from '../../api/client'
+import { requestOpenComfyUIWorkflow, type ComfyUIScalar } from '../../api/comfyui'
 import type { EditorAsset, OutputFile, OutputMetadata } from '../../types'
 import { formatGenerationDuration } from '../../lib/format'
 import { formatDuration } from '../../lib/durationPlanning'
@@ -247,6 +248,16 @@ export function MediaFeedItem({ file, index, isActive, onActivate, onPlaybackSta
   }, [isActive])
 
   const params = meta?.params as Record<string, unknown> | null
+  const comfyWorkflowId = params?.generation_engine === 'comfyui' && typeof params.comfyui_workflow_id === 'string'
+    ? params.comfyui_workflow_id
+    : null
+  const comfyInputs = (() => {
+    const value = params?.comfyui_inputs
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+    return Object.fromEntries(Object.entries(value).filter(([, item]) =>
+      typeof item === 'string' || typeof item === 'boolean' || (typeof item === 'number' && Number.isFinite(item)),
+    )) as Record<string, ComfyUIScalar>
+  })()
   const uploadFilenames = meta?.upload_filenames as Record<string, string | string[]> | undefined
   const mediaTimestamp = getMediaTimestamp(meta?.timestamp, file.created_at)
 
@@ -448,9 +459,13 @@ export function MediaFeedItem({ file, index, isActive, onActivate, onPlaybackSta
   }, [index, onPlaybackStart])
 
   const handleLoadSettings = useCallback(() => {
+    if (comfyWorkflowId) {
+      requestOpenComfyUIWorkflow(comfyWorkflowId, comfyInputs)
+      return
+    }
     setSelectedOutput(index)
     setTimeout(() => loadSettingsFromOutput(), 50)
-  }, [index, setSelectedOutput, loadSettingsFromOutput])
+  }, [comfyWorkflowId, comfyInputs, index, setSelectedOutput, loadSettingsFromOutput])
 
   const handleReroll = useCallback(() => {
     setSelectedOutput(index)
@@ -1041,8 +1056,8 @@ export function MediaFeedItem({ file, index, isActive, onActivate, onPlaybackSta
                 handleLoadSettings()
               }}
               className="rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary"
-              title="Load settings"
-              aria-label="Load settings"
+              title={comfyWorkflowId ? 'Use ComfyUI settings' : 'Load settings'}
+              aria-label={comfyWorkflowId ? 'Use ComfyUI settings' : 'Load settings'}
             >
               <Pencil size={14} />
             </button>
@@ -1390,6 +1405,14 @@ export function MediaFeedItem({ file, index, isActive, onActivate, onPlaybackSta
             {meta?.model_details?.sample_rate && <>
               <dt className="text-text-muted">Audio</dt>
               <dd className="text-text-secondary">{meta.model_details.sample_rate / 1000} kHz · {meta.model_details.channels === 2 ? 'stereo' : `${meta.model_details.channels} channel`}</dd>
+            </>}
+            {meta?.model_details?.speech_generation && <>
+              <dt className="text-text-muted">Speech parts</dt>
+              <dd className={meta.model_details.speech_generation.incomplete ? 'text-amber-400' : 'text-text-secondary'}>
+                {meta.model_details.speech_generation.completed_chunks ?? 0} / {meta.model_details.speech_generation.total_chunks ?? 0} generated
+                {meta.model_details.speech_generation.incomplete ? ' · Partial output' : ''}
+                {meta.model_details.speech_generation.warnings?.map((warning, index) => <p key={index} className="mt-1 text-amber-400">{warning}</p>)}
+              </dd>
             </>}
             {(meta?.model_details?.artists?.length || meta?.model_details?.artist) && <>
               <dt className="text-text-muted">Music LoRAs</dt>

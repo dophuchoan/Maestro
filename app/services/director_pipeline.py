@@ -54,6 +54,8 @@ from services.director_video_strategy import (
 from services.h3_window_planner import compute_h3_window_boundaries
 from services.director.source_contract import director_audio_policy
 from services.text_integrity import repair_payload
+from services.director_music_timing import music_output_frame_total
+from services.video_encoding import get_video_encoding
 from models.minimax_h3.reference_manifest import (
     split_exact_drive_audio_reference,
     validate_reference_manifest,
@@ -67,6 +69,7 @@ _gen_lock = None            # reference to launch._gen_lock
 _active_gen_states = None   # reference to launch._active_gen_states (abort signaling)
 _terminal_callback = None   # top-level Director completion notification
 _queue_terminal_callback = None  # complete Director queue notification
+_prepare_generation_engine = None  # optional per-child engine snapshot callback
 
 _pipelines: dict = {}
 _pipeline_lock = threading.Lock()
@@ -1012,9 +1015,16 @@ def _validate_director_models(
             f"{name} does not support Director Voice Reference. "
             "Remove the voice reference or choose LTX-2 or MiniMax H3 Omni Reference.",
         )
+    prepared_images = params.get("prepared_clip_image_paths")
+    if not isinstance(prepared_images, list):
+        prepared_images = []
     if (
         effective_policy == SHOT_IMAGES_DIRECT_REFERENCES
         and not _director_has_visual_references(params, existing_only=True)
+        and not any(
+            isinstance(path, str) and os.path.isfile(path)
+            for path in prepared_images
+        )
     ):
         raise DirectorModelCompatibilityError(
             f"{name} needs at least one valid image or video reference when "
@@ -1799,6 +1809,75 @@ def _require_video_start_images(
         f"shot(s) {invalid_labels}; video generation was not started. "
         "Use the Dashboard to regenerate the missing images."
     )
+
+
+def _uses_recorded_shot_images(params: dict, policy: str) -> bool:
+    """None skips image generation, not explicitly reviewed scene images.
+
+    Do not infer this from leftover ``clip_images``: changing a generated
+    project to prompt-only must not reuse stale generated composition.
+    Prepared paths are the explicit per-scene upload/review contract and are
+    retained in the saved params snapshot for reruns and resume.
+    """
+    prepared = params.get("prepared_clip_image_paths")
+    return shot_images_required(policy) or (
+        isinstance(prepared, list) and bool(prepared)
+    )
+
+
+def _prepare_reviewed_shot_images(paths: list, count: int, out_dir: str, pipeline_id: str = None) -> list[str]:
+    """Record reviewed starts as direct-child files owned by this pipeline.
+
+    Input materialization may place these files in a nested asset directory,
+    or legacy callers may submit absolute files from another workspace. Copy
+    them into the same bounded layout as generated starts so persistence and
+    rerun validation keep their existing path-containment checks.
+
+    Hybrid (dophuchoan, 2026-11-05): keep the upstream validation and
+    de-duplication above, but name copied files director_<pipeline_id>_shot_001
+    (stable, zero-padded) instead of manual_shot_<n>_<uuid>, preserving the
+    user's earlier stable naming. When pipeline_id is not given, fall back to
+    the upstream manual_shot naming so existing callers/tests keep working.
+    """
+    if len(paths) != count:
+        raise ValueError("Reviewed scene images must contain one image per shot.")
+    sources = []
+    for index, value in enumerate(paths):
+        if (
+            not isinstance(value, str)
+            or not value
+            or os.path.splitext(value)[1].lower() not in _SAVED_MEDIA_EXTENSIONS["image"]
+            or not os.path.isfile(value)
+            or os.path.getsize(value) <= 0
+        ):
+            raise ValueError(
+                f"Reviewed start image for shot {index + 1} is missing or invalid. "
+                "Upload its image again before generating video."
+            )
+        sources.append(os.path.realpath(value))
+    root = os.path.realpath(out_dir)
+    os.makedirs(root, exist_ok=True)
+    copied = {}
+    recorded = []
+    for index, source in enumerate(sources):
+        if source in copied:
+            target = copied[source]
+        else:
+            extension = os.path.splitext(source)[1].lower()
+            if pipeline_id:
+                target = os.path.join(root, f"director_{pipeline_id}_shot_{index + 1:03d}{extension}")
+            else:
+                target = os.path.join(root, f"manual_shot_{index + 1}_{uuid.uuid4().hex[:12]}{extension}")
+            if os.path.normcase(source) != os.path.normcase(target):
+                try:
+                    shutil.copy2(source, target)
+                except Exception:
+                    if os.path.isfile(target):
+                        os.remove(target)
+                    raise
+            copied[source] = target
+        recorded.append(os.path.basename(target))
+    return recorded
 
 
 def _repair_saved_h3_frame_lattice(state: dict) -> bool:
@@ -2923,7 +3002,7 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     video_loras = state.get("video_loras") or {}
     video_params = state.get("video_params") or {}
     shot_image_policy = _saved_pipeline_shot_image_policy(state)
-    uses_shot_images = shot_images_required(shot_image_policy)
+    uses_shot_images = _uses_recorded_shot_images(snapshot, shot_image_policy)
     validation_params = _director_params_from_saved_state(state)
     validation_params["video_model"] = video_model
     _validate_director_models(validation_params, stages=("video",))
@@ -2932,26 +3011,21 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     pipeline_file = _find_pipeline_file(out_dir, pid)
     clip_out_dir = os.path.dirname(pipeline_file) if pipeline_file else out_dir
 
-    # Custom (dophuchoan, merged 2026-10-22): an explicitly uploaded,
-    # already-saved start image should count even for PROMPT_ONLY, where
-    # Image Model = None would otherwise suppress local image creation.
-    start_img = str(clip.get("start_image_filename") or "").strip()
-    has_uploaded_image = bool(
-        start_img
-        and not _invalid_saved_media_numbers(
-            [start_img], 1, clip_out_dir, "image"
-        )
-    )
-
-    if shot_image_policy == SHOT_IMAGE_PROMPT_ONLY and has_uploaded_image:
-        uses_shot_images = True
-
+    # Generated and explicitly reviewed per-scene images retain the strict
+    # conditioning contract, even when the image generator is disabled.
     start_path = ""
     if uses_shot_images:
-        if not has_uploaded_image:
+        # Hybrid fix (2026-11-05): the hunk-1 resolution took upstream's
+        # _uses_recorded_shot_images, which removed the old custom
+        # has_uploaded_image/start_img definitions, so this block must use
+        # upstream's own strict validation instead of referencing them.
+        start_img = clip.get("start_image_filename")
+        if _invalid_saved_media_numbers(
+            [start_img], 1, clip_out_dir, "image",
+        ):
             raise ValueError(
-                "This clip has no valid saved start image. "
-                "Upload a start image before regenerating video."
+                "This clip has no valid start image. Regenerate its start image "
+                "before regenerating video."
             )
         start_path = os.path.join(clip_out_dir, start_img)
 
@@ -4073,6 +4147,111 @@ def rejoin_clips(out_dir: str, pid: str) -> dict:
     return _rejoin_clips_impl(out_dir, pid)
 
 
+def _saved_music_rejoin_options(
+    state: dict,
+    clips: list[dict],
+    audio_path: Optional[str],
+) -> dict:
+    """Return exact frame bounds only for a complete saved Music timeline.
+
+    Older projects and Story timelines do not have the explicit per-clip
+    output-frame contract. Keep their historical concat behavior instead of
+    inferring a target from rounded seconds or generated clip metadata.
+    """
+    if not isinstance(state, dict) or state.get("pipeline_type") != "music_video":
+        return {}
+    if not isinstance(clips, list) or len(clips) < 2:
+        return {}
+
+    planned_clips = []
+    for clip in clips:
+        if not isinstance(clip, dict):
+            return {}
+        planned = clip.get("planned_clip")
+        if (
+            not isinstance(planned, dict)
+            or isinstance(planned.get("music_timing_version"), bool)
+            or planned.get("music_timing_version") != 1
+        ):
+            return {}
+        for key in ("start", "end"):
+            value = planned.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return {}
+            if not math.isfinite(float(value)):
+                return {}
+        if float(planned["end"]) <= float(planned["start"]):
+            return {}
+        planned_clips.append(planned)
+
+    # A frame-bounded rejoin is safe only when the persisted soundtrack
+    # windows still form one exact, ordered timeline. Do not silently bridge a
+    # gap or overlap in an incomplete/legacy plan.
+    if any(
+        abs(float(left["end"]) - float(right["start"])) > 1e-6
+        for left, right in zip(planned_clips, planned_clips[1:])
+    ):
+        return {}
+
+    try:
+        total_frames = music_output_frame_total(
+            [planned.get("output_frames") for planned in planned_clips]
+        )
+    except (TypeError, ValueError):
+        return {}
+    if total_frames <= 0:
+        return {}
+
+    snapshot = state.get("_params_snapshot") or {}
+    profile = state.get("video_execution_profile")
+    profile = profile if isinstance(profile, dict) else {}
+    snapshot_profile = snapshot.get("_director_video_execution_profile")
+    snapshot_profile = snapshot_profile if isinstance(snapshot_profile, dict) else {}
+
+    def _valid_fps(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            candidate = float(value)
+        except (TypeError, ValueError):
+            return None
+        return candidate if math.isfinite(candidate) and candidate > 0 else None
+
+    fps = _valid_fps(profile.get("fps"))
+    if fps is None:
+        fps = _valid_fps(snapshot_profile.get("fps"))
+    if fps is None:
+        # Old saved profiles can lack fps. Resolve it from the same model
+        # catalog used by Director generation; never guess from rounded clip
+        # durations or a frontend default.
+        video_model = (
+            state.get("video_model")
+            or snapshot.get("video_model")
+            or profile.get("model_type")
+            or snapshot_profile.get("model_type")
+        )
+        getter = getattr(_wgp, "get_model_def", None)
+        if video_model and callable(getter):
+            try:
+                model_def = getter(video_model) or {}
+            except Exception:
+                model_def = {}
+            if isinstance(model_def, dict):
+                fps = _valid_fps(model_def.get("fps"))
+    if fps is None:
+        return {}
+
+    duration_sec = total_frames / fps
+    options = {"video_duration_sec": duration_sec}
+    if audio_path:
+        options.update({
+            "pad_audio": True,
+            "audio_duration_sec": duration_sec,
+            "max_audio_pad_sec": 1.0 / fps,
+        })
+    return options
+
+
 def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
     """Re-join all clips from a saved pipeline using current best versions. Returns {filename}."""
     state = load_pipeline_state(out_dir, pid)
@@ -4144,13 +4323,20 @@ def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
     audio_start_sec = _audio_timeline_start([
         clip.get("planned_clip") or {} for clip in clips
     ]) if audio_path else 0.0
+    join_options = _saved_music_rejoin_options(state, clips, audio_path)
 
     import time as _time
     timestamp = _time.strftime("%Y-%m-%d-%Hh%Mm%Ss")
-    output_name = f"{timestamp}_rejoin_multiclip.mp4"
+    output_config = getattr(_wgp, "server_config", {}) or {}
+    encoding = get_video_encoding(
+        output_config.get("video_output_codec", "libx264_8"),
+        output_config.get("video_container", "mp4"),
+    )
+    extension = encoding["extension"]
+    output_name = f"{timestamp}_rejoin_multiclip{extension}"
     output_path = os.path.join(clip_out_dir, output_name)
     while os.path.exists(output_path):
-        output_name = f"{timestamp}_{uuid.uuid4().hex[:8]}_rejoin_multiclip.mp4"
+        output_name = f"{timestamp}_{uuid.uuid4().hex[:8]}_rejoin_multiclip{extension}"
         output_path = os.path.join(clip_out_dir, output_name)
 
     try:
@@ -4164,6 +4350,9 @@ def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
             output_path,
             audio_path,
             audio_start_sec=audio_start_sec,
+            codec_type=encoding["codec_type"],
+            container=encoding["container"],
+            **join_options,
         )
         if not ok or not os.path.isfile(output_path):
             raise RuntimeError("ffmpeg concatenation failed (see server log for the clip that broke it)")
@@ -4176,7 +4365,11 @@ def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
             _write_pipeline_json_unlocked(
                 os.path.splitext(output_path)[0] + ".meta.json",
                 {
-                    "params": {"_director_pipeline_id": pid},
+                    "params": {
+                        "_director_pipeline_id": pid,
+                        "video_quality": encoding["codec_type"],
+                        "video_container": encoding["container"],
+                    },
                     "director_pipeline_id": pid,
                     "director_artifact_kind": "joined",
                     "generation_mode": "video",
@@ -4730,10 +4923,11 @@ def init(
     active_gen_states=None,
     terminal_callback=None,
     queue_terminal_callback=None,
+    prepare_generation_engine=None,
 ):
     """Called by launch.py to wire up shared references."""
     global _jobs, _run_generation, _wgp, _gen_lock, _active_gen_states
-    global _terminal_callback, _queue_terminal_callback
+    global _terminal_callback, _queue_terminal_callback, _prepare_generation_engine
     _jobs = jobs_dict
     _run_generation = run_gen_fn
     _wgp = wgp_module
@@ -4741,6 +4935,7 @@ def init(
     _active_gen_states = active_gen_states
     _terminal_callback = terminal_callback
     _queue_terminal_callback = queue_terminal_callback
+    _prepare_generation_engine = prepare_generation_engine
 
 
 class _DirectorOutputs(list):
@@ -4829,6 +5024,11 @@ def _submit_and_wait(
         "workspace": workspace,
         "out_dir": out_dir,
     }
+    if _prepare_generation_engine is not None:
+        # Freeze route selection before registering or starting this child.
+        # The callback only captures the engine choice; ComfyUI receipts and
+        # prompt submission remain owned by launch.py's normal worker path.
+        job["generation_engine_snapshot"] = _prepare_generation_engine(params)
     _dir_pid = params.get("_director_pipeline_id")
     _detached_operation = bool(params.get("_director_detached_operation"))
     _repair_operation_id = params.get("_director_repair_operation_id")
@@ -5956,6 +6156,7 @@ def _run_pipeline(pid: str, resume: bool = False):
         _style_ref = params.get("reference_image_path") or ""
         if (
             requires_shot_images
+            and params.get("creative_author") != "connected_agent"
             and "_reference_style" not in params
             and _style_ref
             and os.path.isfile(_style_ref)
@@ -5996,34 +6197,14 @@ def _run_pipeline(pid: str, resume: bool = False):
         prepared_image_paths = params.get("prepared_clip_image_paths")
         if not isinstance(prepared_image_paths, list):
             prepared_image_paths = []
-        _prepared_imgs_ok = (
-            bool(prepared_image_paths)
-            and len(prepared_image_paths) == len(clip_plans)
-            and all(
-                isinstance(path, str) and os.path.isfile(path)
-                for path in prepared_image_paths
-            )
-        )
+        _prepared_imgs_ok = bool(prepared_image_paths)
         if _prepared_imgs_ok:
-            # Custom (dophuchoan, merged 2026-10-22): copy prepared/reviewed
-            # scene images into the pipeline folder with stable names, so a
-            # saved project does not depend on paths outside the pipeline.
-            clip_images = []
-            os.makedirs(pipeline_out_dir, exist_ok=True)
-
-            for index, path in enumerate(prepared_image_paths, start=1):
-                source = os.path.realpath(path)
-                extension = os.path.splitext(source)[1].lower()
-
-                filename = f"director_{pid}_shot_{index:03d}{extension}"
-                destination = os.path.realpath(
-                    os.path.join(pipeline_out_dir, filename)
-                )
-
-                if os.path.normcase(source) != os.path.normcase(destination):
-                    shutil.copy2(source, destination)
-
-                clip_images.append(filename)
+            clip_images = _prepare_reviewed_shot_images(
+                prepared_image_paths, len(clip_plans), pipeline_out_dir, pid,
+            )
+            params["prepared_clip_image_paths"] = [
+                os.path.join(pipeline_out_dir, name) for name in clip_images
+            ]
             clip_keyframes = [[] for _ in clip_images]
             print(
                 f"[Pipeline {pid}] Prepared revision: reusing "
@@ -7552,25 +7733,7 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
     director_strategy = video_strategy(model_def)
     execution_profile = _director_video_execution_profile(params)
     shot_image_policy = _director_effective_shot_image_policy(params)
-
-    # Custom (dophuchoan, merged 2026-10-22): PROMPT_ONLY should still use an
-    # explicitly uploaded, already-saved start image instead of suppressing it.
-    uses_shot_images = shot_images_required(shot_image_policy) or (
-        shot_image_policy == SHOT_IMAGE_PROMPT_ONLY
-        and any(
-            isinstance(name, str)
-            and name.strip()
-            and os.path.isfile(
-                os.path.join(out_dir or _wgp.save_path, name)
-            )
-            for name in (clip_images or [])
-        )
-    )
-
-    print(
-        f"[Pipeline {pid}] Start-image conditioning: "
-        f"enabled={uses_shot_images}"
-    )
+    uses_shot_images = _uses_recorded_shot_images(params, shot_image_policy)
     is_minimax_h3 = str(
         model_def.get("architecture") or video_model
     ).lower().startswith("minimax_h3")

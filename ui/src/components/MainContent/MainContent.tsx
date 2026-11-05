@@ -7,7 +7,9 @@ import { ThumbnailGallery } from './ThumbnailGallery'
 import { MediaFeedItem } from './MediaFeedItem'
 import { GalleryViewer, type GalleryImageChoice } from './GalleryViewer'
 import { GenerationPreview } from './GenerationPreview'
+import { JobSettingsDetails } from './JobSettingsDetails'
 import { GlobalQueuePopover } from '../GlobalQueuePopover'
+import { ComfyUIWorkflowDialogHost } from '../Sidebar/ComfyUIWorkflowDialog'
 import { useStore } from '../../stores/useStore'
 import { useIsMobileSidecar } from '../../lib/useIsMobile'
 import { captureGallerySourceImages } from '../../lib/galleryInputs'
@@ -429,6 +431,7 @@ export function JobPlaceholder({ job, onStop, onDismiss }: { job: GenerationJob;
           </button>
         )}
       </div>
+      {isFailed && <JobSettingsDetails job={job} />}
     </div>
   )
 }
@@ -1172,6 +1175,7 @@ export function MainContent() {
 
   return (
     <main className="flex-1 flex flex-col min-h-0 min-w-0 h-full overflow-hidden">
+      <ComfyUIWorkflowDialogHost />
       {/* Top bar */}
       <div className="px-2 md:px-6 py-2 md:py-3 border-b border-border flex items-center justify-between gap-2">
         <TabFilter />

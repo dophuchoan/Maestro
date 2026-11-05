@@ -538,7 +538,15 @@ export interface GenerationPreview {
   total_clips: number
 }
 
+export interface GenerationDetails {
+  /** Settings captured for this job, independent of the current form. */
+  params: Record<string, unknown>
+  workspace?: string
+  performance_plan?: Record<string, unknown>
+}
+
 export interface GenerationJob {
+  generationDetails?: GenerationDetails | null
   enhancement?: PromptEnhancementRecord | null
   id: string
   /** First observation is a saved queue snapshot, not a new terminal event. */
@@ -1556,7 +1564,7 @@ export interface MultiClip {
   directorClipIndex?: number
 }
 
-export type SettingsTab = 'performance' | 'integrations' | 'notifications'
+export type SettingsTab = 'performance' | 'integrations' | 'notifications' | 'agent-access'
 
 export interface ServicesConfig {
   llm_model_id: string
@@ -1812,6 +1820,8 @@ export interface LoraRecommendedWeights {
 
 export interface LoraInfo {
   filename: string
+  /** Technical acceleration label for list filtering, not compatibility. */
+  is_acceleration?: boolean
   /** Resolved user-facing name: explicit override, site/guide metadata, or file stem. */
   display_name?: string
   /** Explicit user alias, or null when the automatic name is in use. */
