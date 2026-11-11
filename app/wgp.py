@@ -561,7 +561,7 @@ def process_prompt_and_add_tasks(state, current_gallery_tab, model_choice):
             inputs.update({
                 "prompt": single_prompt,
                 "image_start": image_start[i],
-                "image_end": None,
+                "image_end": image_end[i] if image_end is not None and i < len(image_end) else None,
                 "video_length": sliding_window_size_val,
                 "audio_frame_offset": i * sliding_window_size_val,
                 "multi_clip_info": {"group_id": group_id, "index": i, "total": len(prompts)},
